@@ -6,6 +6,13 @@ import type { PolicyRules } from "@4evergent/shared";
 import type { AddressInfo } from "node:net";
 import { createApiServer } from "../src/index.js";
 import { DevAuthProvider } from "@4evergent/shared";
+import {
+  createActivity,
+  createApproval,
+  InMemoryActivityStore,
+  InMemoryApprovalStore,
+  InMemoryExecutionStore,
+} from "@4evergent/database";
 
 // NOTE: approval integration tests must not call the live Horizon network.
 // We test only the persistence + state-machine + idempotency behavior.
@@ -32,7 +39,7 @@ const TEST_AGENT = {
   displayName: "Test",
   description: "test agent",
   ownerId: "test",
-  stellarAddress: "GDAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+  stellarAddress: "GDI73WJ4SX7LOG3XZDJC3KCK6ED6E5NBYK2JUBQSPBCNNWEG3ZN7T75U",
   capabilities: [],
   status: "active",
   createdAt: new Date().toISOString(),
@@ -347,6 +354,200 @@ test("approval does not leak secrets in response", async () => {
     const approveRes = await post(baseUrl, `/approvals/${intentRes.body.approvalId}/approve`, { approver: "tester" });
     const json = JSON.stringify(intentRes) + JSON.stringify(approveRes);
     assert.ok(!/secret|seed|private_key|mnemonic|keypair/i.test(json));
+  } finally {
+    await close();
+  }
+});
+
+// ===== #372: concurrent approve/reject — atomic claim via updateIfStatus =====
+
+async function startQueueServer(opts?: {
+  policyRules?: Partial<PolicyRules>;
+  approvalStore?: InMemoryApprovalStore;
+  activityStore?: InMemoryActivityStore;
+}) {
+  const signer = new MockSigner("test-agent");
+  const activityStore = opts?.activityStore ?? new InMemoryActivityStore();
+  const approvalStore = opts?.approvalStore ?? new InMemoryApprovalStore();
+  const executionStore = new InMemoryExecutionStore();
+  const server = await createApiServer({
+    port: 0,
+    horizonUrl: "https://horizon-testnet.stellar.org",
+    signer,
+    policyRules: opts?.policyRules,
+    authProvider: new DevAuthProvider({ defaultOwnerId: "test" }),
+    activityStore,
+    approvalStore,
+    executionStore,
+    executionQueue: { enabled: true, intervalMs: 60_000 },
+  });
+  server.registerAgent(TEST_AGENT);
+
+  return new Promise<{
+    baseUrl: string;
+    close: () => Promise<void>;
+    store: typeof server.store;
+    approvals: typeof server.approvals;
+    executionStore: InMemoryExecutionStore;
+  }>((resolve) => {
+    const http = server.server.listen(0, "127.0.0.1", () => {
+      const addr = http.address() as AddressInfo;
+      resolve({
+        baseUrl: `http://127.0.0.1:${addr.port}`,
+        close: () => server.close(),
+        store: server.store,
+        approvals: server.approvals,
+        executionStore,
+      });
+    });
+  });
+}
+
+async function pendingApprovalId(baseUrl: string): Promise<string> {
+  const res = await post(baseUrl, "/agents/test-agent/intents", {
+    type: "payment",
+    asset: "XLM",
+    destination: Keypair.random().publicKey(),
+    amount: "50",
+    reason: "concurrency test",
+  });
+  assert.equal(res.status, 202);
+  return res.body.approvalId;
+}
+
+async function waitFor(fn: () => Promise<boolean>, timeoutMs = 2000): Promise<void> {
+  const deadline = Date.now() + timeoutMs;
+  for (;;) {
+    if (await fn()) return;
+    if (Date.now() > deadline) throw new Error("waitFor timed out");
+    await new Promise((r) => setTimeout(r, 25));
+  }
+}
+
+test("approval: concurrent approve+approve → 1x200 1x409, exactly one execution record", async () => {
+  const rules: Partial<PolicyRules> = {
+    maxTxAmount: { XLM: "1000" },
+    requireHumanApprovalForAmountAbove: "10",
+  };
+  const { baseUrl, close, approvals, executionStore } = await startQueueServer({ policyRules: rules });
+  try {
+    const approvalId = await pendingApprovalId(baseUrl);
+    const [first, second] = await Promise.all([
+      post(baseUrl, `/approvals/${approvalId}/approve`, {}),
+      post(baseUrl, `/approvals/${approvalId}/approve`, {}),
+    ]);
+    const statuses = [first.status, second.status].sort();
+    assert.deepEqual(statuses, [200, 409]);
+    // The loser is always a 409 with no side effects. Which 409 code it gets
+    // depends on timing: APPROVAL_CONFLICT when its read lands before the
+    // winner's atomic claim, APPROVAL_INVALID_STATE when it lands after.
+    // The atomic claim itself is covered deterministically at the store level
+    // (updateIfStatus tests in packages/database/test/store.test.ts).
+    const loser = first.status === 409 ? first : second;
+    assert.ok(loser.body.code === "APPROVAL_CONFLICT" || loser.body.code === "APPROVAL_INVALID_STATE");
+
+    const approval = await approvals.get(approvalId);
+    assert.equal(approval!.status, "approved");
+
+    // Exactly one execution record for the winning approve (enqueue is
+    // fire-and-forget, so poll briefly).
+    await waitFor(async () => {
+      const records = await executionStore.listByAgent("test-agent");
+      return records.filter((r) => r.approvalId === approvalId).length === 1;
+    });
+  } finally {
+    await close();
+  }
+});
+
+test("approval: concurrent approve+reject → 1x200 1x409, loser creates nothing", async () => {
+  const rules: Partial<PolicyRules> = {
+    maxTxAmount: { XLM: "1000" },
+    requireHumanApprovalForAmountAbove: "10",
+  };
+  const { baseUrl, close, approvals, executionStore, store } = await startQueueServer({ policyRules: rules });
+  try {
+    const approvalId = await pendingApprovalId(baseUrl);
+    const [approveRes, rejectRes] = await Promise.all([
+      post(baseUrl, `/approvals/${approvalId}/approve`, {}),
+      post(baseUrl, `/approvals/${approvalId}/reject`, {}),
+    ]);
+    const statuses = [approveRes.status, rejectRes.status].sort();
+    assert.deepEqual(statuses, [200, 409]);
+    // Same timing note as the approve+approve test: the loser is always a
+    // 409; the exact code depends on whether its read lands before or after
+    // the winner's atomic claim.
+    const loser = approveRes.status === 409 ? approveRes : rejectRes;
+    assert.ok(loser.body.code === "APPROVAL_CONFLICT" || loser.body.code === "APPROVAL_INVALID_STATE");
+
+    const approval = await approvals.get(approvalId);
+    assert.ok(approval!.status === "approved" || approval!.status === "rejected");
+    // Reject winning means no execution record at all; approve winning means
+    // exactly one. Either way there is never a second record or a
+    // rejected-then-executed approval.
+    const expectedRecords = approval!.status === "approved" ? 1 : 0;
+    await waitFor(async () => {
+      const records = await executionStore.listByAgent("test-agent");
+      return records.filter((r) => r.approvalId === approvalId).length === expectedRecords;
+    });
+    if (approval!.status === "rejected") {
+      const activity = await store.get(approval!.activityId);
+      assert.equal(activity!.status, "rejected");
+    }
+  } finally {
+    await close();
+  }
+});
+
+test("approval: sequential approve after reject stays APPROVAL_INVALID_STATE", async () => {
+  const rules: Partial<PolicyRules> = {
+    maxTxAmount: { XLM: "1000" },
+    requireHumanApprovalForAmountAbove: "10",
+  };
+  const { baseUrl, close, approvals } = await startServer({ policyRules: rules, deferExecution: true });
+  try {
+    const approvalId = await pendingApprovalId(baseUrl);
+    const rejected = await post(baseUrl, `/approvals/${approvalId}/reject`, {});
+    assert.equal(rejected.status, 200);
+
+    const lateApprove = await post(baseUrl, `/approvals/${approvalId}/approve`, {});
+    assert.equal(lateApprove.status, 409);
+    assert.equal(lateApprove.body.code, "APPROVAL_INVALID_STATE");
+    assert.match(lateApprove.body.message, /cannot approve/);
+    assert.equal((await approvals.get(approvalId))!.status, "rejected");
+  } finally {
+    await close();
+  }
+});
+
+// ===== #376: startup recovery of a stale `executing` approval =====
+
+test("approval-recovery: stale executing approval is failed at server startup", async () => {
+  const activityStore = new InMemoryActivityStore();
+  const approvalStore = new InMemoryApprovalStore();
+  const activity = createActivity("test-agent", "test", {
+    type: "payment",
+    asset: "XLM",
+    destination: Keypair.random().publicKey(),
+    amount: "50",
+    reason: "recovery startup test",
+  } as any, { result: "requires_approval", reason: "Requires human approval", rule: "approvalThreshold", intent: null as any });
+  activity.status = "requires_approval";
+  activity.authorizationStatus = "pending_approval";
+  await activityStore.record(activity);
+
+  const approval = createApproval(activity.id, "test-agent", "test", activity.intent, activity.policyDecision, null);
+  approval.status = "executing";
+  // Stale: last touched 10 minutes ago, no hash recorded (crash before submit).
+  approval.updatedAt = new Date(Date.now() - 10 * 60 * 1000).toISOString();
+  await approvalStore.record(approval);
+
+  const { close } = await startQueueServer({ approvalStore, activityStore });
+  try {
+    const saved = await approvalStore.get(approval.id);
+    assert.equal(saved?.status, "failed");
+    assert.match(saved?.error ?? "", /no recorded transaction hash/);
+    assert.equal((await activityStore.get(activity.id))?.status, "failed");
   } finally {
     await close();
   }
