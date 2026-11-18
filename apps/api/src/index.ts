@@ -1,12 +1,13 @@
 import { createServer } from "node:http";
-import { randomUUID } from "node:crypto";
 import { AsyncLocalStorage } from "node:async_hooks";
+import { log, generateRequestId, runRequestIdContext } from "./logging.js";
 import type {
   AgentIntent,
   AuthorizationStatus,
   PolicyDecision,
   SimulationResult,
 } from "@4evergent/shared";
+import { API_ERRORS, type ApiErrorCode } from "./error-codes.js";
 import { IntentValidator } from "@4evergent/agent-core";
 import { PolicyEngine, DEFAULT_RULES, validatePolicyRules, normalizePolicyRules } from "@4evergent/policy";
 import { StellarAdapter } from "@4evergent/agent-core";
@@ -16,7 +17,9 @@ import { AgentScheduler } from "./scheduler.js";
 import { ScheduleExecutionService } from "./schedule-execution.js";
 import { ExecutionQueue } from "./execution-queue.js";
 import { ExecutionRecoveryService } from "./execution-recovery.js";
+import { ScheduleRecoveryService } from "./schedule-recovery.js";
 import { TransactionStatusReconciler } from "@4evergent/stellar";
+import { ApprovalRecoveryService } from "@4evergent/stellar";
 import { AccountSequenceCoordinator } from "./account-sequence-coordinator.js";
 import type { ExecutionRecord, ExecutionStatus } from "@4evergent/database";
 import type { ScheduleExecutionResult } from "./schedule-execution.js";
@@ -32,6 +35,7 @@ import {
   SQLiteScheduleStore,
   SQLiteExecutionStore,
   SQLiteAgentStore,
+  MAX_LIMIT,
   SQLitePolicyConfigStore,
   assertNoSecrets,
   validateApprovalTransition,
@@ -46,9 +50,11 @@ import {
   type ActivityRecord,
   type PolicyConfigStore,
   createActivity,
+  isOffsetAtCeiling,
 } from "@4evergent/database";
 import type { PolicyRules, Agent, RequestContext, AuthorizationService, AuthProvider, AuthenticatedPrincipal } from "@4evergent/shared";
 import { createAuthModule, type PrincipalResolution } from "./auth.js";
+import { sweepRetainedData } from "./data-retention.js";
 
 const TESTNET_PASSPHRASE = "Test SDF Network ; September 2015";
 
@@ -74,8 +80,35 @@ interface ApprovalResponse {
 
 const agents = new Map<string, Agent>();
 
+export { ScheduleRecoveryService, type ScheduleRecoveryResult, type ScheduleRecoveryOptions } from "./schedule-recovery.js";
+
 export function clearAgents() {
   agents.clear();
+}
+
+const APPROVAL_STATUSES = [
+  "pending_approval",
+  "approved",
+  "rejected",
+  "expired",
+  "executing",
+  "submitted",
+  "confirmed",
+  "failed",
+] as const satisfies readonly ApprovalStatus[];
+
+function parseStatusFilter<T extends string>(
+  raw: string | null,
+  valid: readonly T[]
+): { ok: true; status?: T } | { ok: false; error: string } {
+  if (raw === null) return { ok: true };
+  if ((valid as readonly string[]).includes(raw)) {
+    return { ok: true, status: raw as T };
+  }
+  return {
+    ok: false,
+    error: `invalid status '${raw}'; valid values: ${valid.join(", ")}`,
+  };
 }
 
 export interface ServerOptions {
@@ -92,10 +125,17 @@ export interface ServerOptions {
   /** Origin allowed for credentialed CORS (the browser app origin). */
   corsOrigin?: string;
   authorizationService?: AuthorizationService;
+  /** Readiness probes share one bounded, briefly cached dependency check. */
+  readiness?: {
+    timeoutMs?: number;
+    cacheMs?: number;
+    fetcher?: typeof globalThis.fetch;
+  };
   /** Enable the background scheduler to execute due schedules. */
   scheduler?: {
     enabled?: boolean;
     intervalMs?: number;
+    maxLatenessMs?: number;
     /** Inject a custom scheduler (e.g. for testing). */
     instance?: AgentScheduler;
   };
@@ -114,11 +154,28 @@ export interface ServerOptions {
   };
   /** User authentication module (sessions: email / Google / Stellar wallet). */
   authModule?: ReturnType<typeof createAuthModule>;
+  /** Periodic cleanup of expired browser sessions and old daily-spending reservations. */
+  retention?: {
+    enabled?: boolean;
+    intervalMs?: number;
+    authSessionDays?: number;
+    dailySpendingDays?: number;
+  };
   /** Enable on-chain transaction status reconciliation (opt-in). */
   reconciliation?: {
     enabled?: boolean;
     intervalMs?: number;
     instance?: import("@4evergent/stellar").TransactionStatusReconciler;
+  };
+  /** Recover approvals stuck in `executing` after a crash (#376).
+   *  Runs once at startup when the execution queue is enabled and, when
+   *  reconciliation is enabled, sweeps periodically on the same lifecycle.
+   *  The on-chain check uses the Horizon adapter, so no extra config is
+   *  needed; pass `instance` to inject a custom service (e.g. for testing). */
+  approvalRecovery?: {
+    intervalMs?: number;
+    staleAfterMs?: number;
+    instance?: import("@4evergent/stellar").ApprovalRecoveryService;
   };
 }
 
@@ -204,6 +261,84 @@ export async function createApiServer(options: ServerOptions) {
   const policy = new PolicyEngine(options.policyRules, store as any, getRules);
   const adapter = new StellarAdapter(options.horizonUrl);
 
+  const readinessTimeoutMs = options.readiness?.timeoutMs ?? 2_000;
+  const readinessCacheMs = options.readiness?.cacheMs ?? 5_000;
+  for (const [name, value] of Object.entries({ readinessTimeoutMs, readinessCacheMs })) {
+    if (!Number.isFinite(value) || value <= 0) throw new Error(`${name} must be positive`);
+  }
+  type DependencyChecks = { horizon: "ok" | "fail"; database: "ok" | "fail" };
+  let readinessCache: { checks: DependencyChecks; expiresAt: number } | null = null;
+  let readinessInFlight: Promise<DependencyChecks> | null = null;
+  // A check that ignores its abort signal keeps running after it times out.
+  // Later probes wait on that same call instead of starting another, so a hung
+  // dependency holds at most one outstanding call per check, however many
+  // probes arrive.
+  const outstandingChecks = new Map<string, { work: Promise<unknown>; controller: AbortController }>();
+
+  async function boundedCheck(name: string, check: (signal: AbortSignal) => Promise<unknown>): Promise<"ok" | "fail"> {
+    let entry = outstandingChecks.get(name);
+    if (!entry) {
+      const controller = new AbortController();
+      const work = Promise.resolve().then(() => check(controller.signal));
+      const started = { work, controller };
+      const settle = () => {
+        if (outstandingChecks.get(name) === started) outstandingChecks.delete(name);
+      };
+      work.then(settle, settle);
+      outstandingChecks.set(name, started);
+      entry = started;
+    }
+    const { work, controller } = entry;
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    try {
+      await Promise.race([
+        work,
+        new Promise<never>((_, reject) => {
+          timer = setTimeout(() => {
+            controller.abort();
+            reject(new Error("Readiness check timed out"));
+          }, readinessTimeoutMs);
+        }),
+      ]);
+      return "ok";
+    } catch {
+      // Public responses expose status only, never dependency errors or records.
+      return "fail";
+    } finally {
+      if (timer) clearTimeout(timer);
+    }
+  }
+
+  function dependencyReadiness(): Promise<DependencyChecks> {
+    if (readinessCache && Date.now() < readinessCache.expiresAt) {
+      return Promise.resolve(readinessCache.checks);
+    }
+    if (readinessInFlight) return readinessInFlight;
+    readinessInFlight = (async () => {
+      const [horizon, database] = await Promise.all([
+        boundedCheck("horizon", async signal => {
+          const fetcher = options.readiness?.fetcher ?? globalThis.fetch;
+          const probeAdapter = new StellarAdapter(options.horizonUrl,
+            (input, init) => fetcher(input, { ...init, signal }));
+          await probeAdapter.getNetworkInfo();
+        }),
+        boundedCheck("database", async () => {
+          // Exercise the actual configured stores, including injected/in-memory
+          // stores, rather than a new connection that could hide a broken handle.
+          await Promise.all([
+            store.listAll(1), approvals.listAll(1),
+            schedules.listByOwner("", 1), executionStore.listByOwner("", 1),
+            agentStore.listByOwner("", 1), policyConfigStore.listByOwner(""),
+          ]);
+        }),
+      ]);
+      const checks = { horizon, database };
+      readinessCache = { checks, expiresAt: Date.now() + readinessCacheMs };
+      return checks;
+    })().finally(() => { readinessInFlight = null; });
+    return readinessInFlight;
+  }
+
   // Phase 28I: Agent existence check with persistent fallback.
   // Mirrors ResourceAuthorizationService.resolveAgent so handlers can find
   // agents that survive a server restart (present in agentStore but not in
@@ -229,7 +364,15 @@ export async function createApiServer(options: ServerOptions) {
     (options.dbPath ? new SQLiteExecutionStore(options.dbPath) : new InMemoryExecutionStore());
 
   // --- Execution recovery setup ---
-  const recoveryService = new ExecutionRecoveryService(executionStore);
+  const recoveryPreCheck = async (txHash: string) => {
+    const status = await adapter.getTransactionStatus(txHash);
+    if (status === "confirmed" || status === "failed") return "found" as const;
+    if (status === "not_found") return "not_found" as const;
+    return "network_error" as const;
+  };
+  const recoveryService = new ExecutionRecoveryService(executionStore, {
+    preCheck: recoveryPreCheck,
+  });
   let executionQueue: ExecutionQueue | null = null;
   let reconciler: import("@4evergent/stellar").TransactionStatusReconciler | null = null;
 
@@ -247,6 +390,35 @@ export async function createApiServer(options: ServerOptions) {
     }
   }
 
+  // --- Stuck-approval recovery setup (#376) ---
+  // Same crash window as executions, one level up: an approval left in
+  // `executing` (process died between approval and submission) never reaches
+  // a terminal state on its own. Recover once at startup (before the queue
+  // worker starts, so a recovered approval is never executed twice) and
+  // sweep periodically while the server runs. The on-chain check reuses the
+  // Horizon adapter; without a stored hash the approval is failed with an
+  // explicit "could not verify" error (see ApprovalRecoveryService).
+  const approvalRecovery: import("@4evergent/stellar").ApprovalRecoveryService =
+    options.approvalRecovery?.instance ??
+    new ApprovalRecoveryService(approvals, store, {
+      getStatus: (txHash: string) => adapter.getTransactionStatus(txHash),
+    }, {
+      intervalMs: options.approvalRecovery?.intervalMs,
+      staleAfterMs: options.approvalRecovery?.staleAfterMs,
+    });
+  if (options.executionQueue?.enabled) {
+    try {
+      const approvalRecoveryResult = await approvalRecovery.recover();
+      if (approvalRecoveryResult.found > 0) {
+        console.log(
+          `[approval-recovery] recovered ${approvalRecoveryResult.recovered}/${approvalRecoveryResult.found} stuck approvals`
+        );
+      }
+    } catch (err) {
+      console.error("[approval-recovery] recovery failed:", err);
+    }
+  }
+
   // --- Transaction status reconciliation setup ---
   if (options.reconciliation?.enabled) {
     const statusProvider: import("@4evergent/stellar").TransactionStatusProvider = {
@@ -259,6 +431,9 @@ export async function createApiServer(options: ServerOptions) {
       });
     reconciler.start();
     console.log("[reconciler] started, interval:", options.reconciliation.intervalMs ?? 30_000, "ms");
+    // Periodic stuck-approval sweep rides on the reconciliation lifecycle.
+    approvalRecovery.start();
+    console.log("[approval-recovery] started, interval:", options.approvalRecovery?.intervalMs ?? 60_000, "ms");
   }
 
   if (options.executionQueue?.enabled) {
@@ -271,7 +446,10 @@ export async function createApiServer(options: ServerOptions) {
       };
     };
 
-    const pipelineExecutor = async (record: ExecutionRecord) => {
+    const pipelineExecutor = async (
+      record: ExecutionRecord,
+      context?: import("./execution-queue.js").ExecutionContext
+    ) => {
       // Phase 25: Wrap sequence-sensitive execution in account-scoped lock.
       //
       // WHY: Two concurrent executions using the SAME Stellar source account
@@ -289,14 +467,31 @@ export async function createApiServer(options: ServerOptions) {
       // two executions read the same sequence before either acquires the lock.
       const accountId = options.signer.getAccountId();
       return sequenceCoordinator.runExclusive(accountId, async () => {
+        if (context?.signal?.aborted) {
+          const err = new Error("Execution was cancelled");
+          err.name = "AbortError";
+          throw err;
+        }
         try {
           const sourceAccount = await getSourceAccount();
+          if (context?.signal?.aborted) {
+            const err = new Error("Execution was cancelled");
+            err.name = "AbortError";
+            throw err;
+          }
           const outcome = await pipeline.execute({
             intent: record.intent,
             sourceAccount,
             activityId: record.activityId ?? undefined,
+            signal: context?.signal,
+            onBeforeSubmit: () => {
+              context?.onBeforeSubmit?.();
+            },
           });
           const txHash = (outcome as { txHash?: string }).txHash;
+          if (txHash) {
+            context?.onSubmitted?.(txHash);
+          }
           return {
             record,
             success: outcome.status === "submitted",
@@ -308,6 +503,20 @@ export async function createApiServer(options: ServerOptions) {
             activityId: (outcome as { activityId?: string }).activityId ?? record.activityId ?? undefined,
           };
         } catch (err: unknown) {
+          if (context?.signal?.aborted) {
+            if (record.activityId && options.activityStore) {
+              try {
+                await options.activityStore.update(record.activityId, {
+                  status: "failed",
+                  error: "cancelled by user",
+                  updatedAt: new Date().toISOString(),
+                });
+              } catch {
+                // ActivityStore update failure is non-critical
+              }
+            }
+            throw err;
+          }
           // Pipeline failed before persisting activity (e.g., source account load failure).
           // Update the pre-created ActivityRecord to reflect the failure so the
           // activity record is not left in "pending" indefinitely.
@@ -356,9 +565,35 @@ export async function createApiServer(options: ServerOptions) {
   // --- Scheduler setup ---
   // The scheduler executes due schedules via the SAME pipeline as manual intents.
   // It is opt-in: only starts if options.scheduler.enabled is true.
+  // --- Schedule recovery setup ---
+  const scheduleRecoveryService = new ScheduleRecoveryService(schedules);
+
   let scheduler: AgentScheduler | null = null;
   if (options.scheduler?.enabled) {
-    const scheduleExecution = new ScheduleExecutionService({
+    let recoverySucceeded = false;
+    try {
+      const recoveryResult = await scheduleRecoveryService.recover();
+      if (recoveryResult.errors.length > 0) {
+        console.error(
+          `[schedule-recovery] recovery encountered ${recoveryResult.errors.length} error(s); scheduler will not be started to prevent duplicate triggers`
+        );
+      } else {
+        if (recoveryResult.found > 0) {
+          console.log(
+            `[schedule-recovery] recovered ${recoveryResult.recovered}/${recoveryResult.found} interrupted schedules`
+          );
+        }
+        recoverySucceeded = true;
+      }
+    } catch (err) {
+      console.error(
+        "[schedule-recovery] recovery failed; scheduler will not be started to prevent duplicate triggers:",
+        err
+      );
+    }
+
+    if (recoverySucceeded) {
+      const scheduleExecution = new ScheduleExecutionService({
       activityStore: store,
       approvalStore: approvals,
       getSourceAccount: async () => {
@@ -452,13 +687,48 @@ export async function createApiServer(options: ServerOptions) {
           }
           return scheduleExecution.executeSchedule(schedule);
         },
-        options.scheduler.intervalMs !== undefined
-          ? { intervalMs: options.scheduler.intervalMs }
-          : {}
+        { intervalMs: options.scheduler.intervalMs, maxLatenessMs: options.scheduler.maxLatenessMs }
       );
 
-    scheduler.start();
-    console.log("[scheduler] started, interval:", options.scheduler.intervalMs ?? 60_000, "ms");
+      scheduler.start();
+      console.log("[scheduler] started, interval:", options.scheduler.intervalMs ?? 60_000, "ms");
+    }
+  }
+
+  let retentionTimer: ReturnType<typeof setInterval> | null = null;
+  let retentionRunning = false;
+  if (options.retention?.enabled !== false) {
+    const intervalMs = Number.isFinite(options.retention?.intervalMs) && options.retention!.intervalMs! > 0
+      ? options.retention!.intervalMs!
+      : 24 * 60 * 60_000;
+    const sessionDays = Number.isFinite(options.retention?.authSessionDays) && options.retention!.authSessionDays! >= 0
+      ? options.retention!.authSessionDays!
+      : 30;
+    const spendingDays = Number.isFinite(options.retention?.dailySpendingDays) && options.retention!.dailySpendingDays! >= 0
+      ? options.retention!.dailySpendingDays!
+      : 90;
+    const sweepRetention = async () => {
+      if (retentionRunning) return;
+      retentionRunning = true;
+      try {
+        const result = await sweepRetainedData({
+          store,
+          authModule,
+          now: Date.now(),
+          authSessionDays: sessionDays,
+          dailySpendingDays: spendingDays,
+          batchSize: 500,
+        });
+        console.log(`[retention] sweep complete: auth_sessions=${result.authSessionsRemoved}, daily_spending=${result.dailySpendingRemoved}`);
+      } catch (err) {
+        console.error("[retention] sweep failed:", err);
+      } finally {
+        retentionRunning = false;
+      }
+    };
+    void sweepRetention();
+    retentionTimer = setInterval(() => { void sweepRetention(); }, intervalMs);
+    retentionTimer.unref?.();
   }
 
   // CORS configuration — configurable via CORS_ORIGIN environment variable.
@@ -480,6 +750,37 @@ export async function createApiServer(options: ServerOptions) {
   const server = createServer(async (req, res) => {
     const url = req.url ?? "";
     const method = req.method ?? "GET";
+
+    // Phase 28L: Request logging with correlation IDs.
+    // Assigned before any handler runs so every response — including
+    // OPTIONS preflights and 401/404 errors — carries X-Request-Id.
+    const suppliedId = req.headers["x-request-id"];
+    const requestId = generateRequestId(
+      Array.isArray(suppliedId) ? suppliedId[0] : suppliedId,
+    );
+    res.setHeader("X-Request-Id", requestId);
+
+    const requestStart = Date.now();
+    let ownerId: string | null = null;
+    let logged = false;
+
+    const originalEnd = res.end.bind(res);
+    res.end = function (...args: any[]) {
+      if (!logged) {
+        logged = true;
+        const durationMs = Date.now() - requestStart;
+        const status = res.statusCode || 0;
+        log(status >= 500 ? "error" : "info", "request completed", {
+          method,
+          path: new URL(url, "http://localhost").pathname,
+          status,
+          durationMs,
+          requestId,
+          ownerId,
+        });
+      }
+      return originalEnd(...args);
+    };
 
     // Handle CORS preflight (OPTIONS) — does NOT bypass authentication for
     // actual API requests. Preflight is unauthenticated but returns no data.
@@ -526,11 +827,30 @@ export async function createApiServer(options: ServerOptions) {
     // Phase 28K-1: Authenticate and create request-scoped context
     const resolution = await authenticateRequest(req, method);
     const requestScopedCtx = principalToContext(resolution.principal);
+    ownerId = requestScopedCtx.ownerId;
 
+    return runRequestIdContext(requestId, () => {
     return als.run(requestScopedCtx, () => {
       // Health check is public
       if (method === "GET" && url === "/health") {
         return json(res, { status: "ok", signerAccountId: options.signer.getAccountId() });
+      }
+
+      // Public readiness: bounded/cached dependency reads, fresh worker status.
+      if (method === "GET" && url === "/health/ready") {
+        return dependencyReadiness().then(dependencies => {
+          const checks = {
+            ...dependencies,
+            executionQueue: options.executionQueue?.enabled
+              ? (executionQueue?.isRunning() ? "ok" : "fail") : "disabled",
+            scheduler: options.scheduler?.enabled
+              ? (scheduler?.isRunning() ? "ok" : "fail") : "disabled",
+          };
+          const status = dependencies.horizon === "fail" || dependencies.database === "fail"
+            ? "unavailable"
+            : checks.executionQueue === "fail" || checks.scheduler === "fail" ? "degraded" : "ok";
+          return json(res, { status, checks }, status === "ok" ? 200 : 503);
+        });
       }
 
       // CSRF guard: a valid session principal that failed the custom-header
@@ -538,12 +858,12 @@ export async function createApiServer(options: ServerOptions) {
       // 401 gate so forged (cross-site) writes surface as 403, while an
       // unauthenticated request still gets 401.
       if (resolution.csrfFail) {
-        return json(res, { error: "csrf_failed" }, 403);
+        return apiError(res, "CSRF_FAILED");
       }
 
       // Protected endpoints require authentication
       if (!requestScopedCtx.ownerId) {
-        return json(res, { error: "unauthorized" }, 401);
+        return apiError(res, "UNAUTHORIZED");
       }
 
       if (method === "POST" && url === "/agents") {
@@ -566,7 +886,7 @@ export async function createApiServer(options: ServerOptions) {
       return handlePutPolicy(requestScopedCtx, req, res);
     }
 
-    if (method === "GET" && url === "/agents") {
+    if (method === "GET" && /^\/agents(\?.*)?$/.test(url)) {
       return handleListAgents(requestScopedCtx, req, res);
     }
     if (method === "GET" && /^\/agents\/[^/]+$/.test(url)) {
@@ -635,12 +955,34 @@ export async function createApiServer(options: ServerOptions) {
     if (method === "POST" && /^\/executions\/[^/]+\/cancel$/.test(url)) {
       return handleCancelExecution(requestScopedCtx, req, res);
     }
-    json(res, { error: "not found" }, 404);
+    apiError(res, "NOT_FOUND");
     }); // End als.run
+    }); // End runRequestIdContext
   });
 
-  async function handleListAgents(ctx: RequestContext, _req: any, res: any) {
-    const all = await agentStore.listByOwner(ctx.ownerId!);
+  async function handleListAgents(ctx: RequestContext, req: any, res: any) {
+    const urlObj = new URL(req.url ?? "", "http://localhost");
+    const capability = urlObj.searchParams.get("capability");
+    const hasLimit = urlObj.searchParams.has("limit");
+    const rawLimit = urlObj.searchParams.get("limit");
+
+    let limit: number | undefined;
+    if (hasLimit) {
+      // Empty string, non-numeric, or fractional values are rejected.
+      if (rawLimit === null || rawLimit.trim() === "") {
+        return apiError(res, "VALIDATION_ERROR", { message: "limit must be a valid integer" });
+      }
+      const parsed = Number(rawLimit);
+      if (!Number.isFinite(parsed) || !Number.isInteger(parsed)) {
+        return apiError(res, "VALIDATION_ERROR", { message: "limit must be a valid integer" });
+      }
+      limit = Math.max(1, Math.min(MAX_LIMIT, parsed));
+    }
+
+    const all = capability !== null
+      ? await agentStore.listByCapability(ctx.ownerId!, capability, limit)
+      : await agentStore.listByOwner(ctx.ownerId!, limit);
+
     const agentList = all.map((a) => ({
       id: a.id,
       displayName: a.displayName,
@@ -661,32 +1003,60 @@ export async function createApiServer(options: ServerOptions) {
       const text = await readBody(req);
       body = text ? JSON.parse(text) : {};
     } catch {
-      return json(res, { error: "invalid JSON body" }, 400);
+      return apiError(res, "INVALID_JSON");
     }
 
     const b = body as Record<string, unknown>;
     const displayName = b.displayName;
     if (typeof displayName !== "string" || displayName.trim().length === 0) {
-      return json(res, { error: "displayName is required" }, 400);
+      return apiError(res, "VALIDATION_ERROR", { message: "displayName is required" });
     }
     if (displayName.trim().length > 100) {
-      return json(res, { error: "displayName must be 100 characters or fewer" }, 400);
+      return apiError(res, "VALIDATION_ERROR", { message: "displayName must be 100 characters or fewer" });
     }
 
-    const description = typeof b.description === "string" ? b.description : "";
+    let description = "";
+    if (b.description !== undefined) {
+      if (typeof b.description !== "string") {
+        return apiError(res, "VALIDATION_ERROR", { message: "description must be a string" });
+      }
+      if (b.description.length > 500) {
+        return apiError(res, "VALIDATION_ERROR", { message: "description must be 500 characters or fewer" });
+      }
+      description = b.description;
+    }
 
     let capabilities: string[] = [];
     if (b.capabilities !== undefined) {
       if (!Array.isArray(b.capabilities) || !b.capabilities.every((c) => typeof c === "string")) {
-        return json(res, { error: "capabilities must be an array of strings" }, 400);
+        return apiError(res, "VALIDATION_ERROR", { message: "capabilities must be an array of strings" });
       }
-      capabilities = b.capabilities as string[];
+      if (b.capabilities.length > 32) {
+        return apiError(res, "VALIDATION_ERROR", { message: "capabilities must be 32 entries or fewer" });
+      }
+      const trimmedCaps: string[] = [];
+      const seen = new Set<string>();
+      for (const cap of b.capabilities) {
+        const trimmed = cap.trim();
+        if (trimmed.length === 0) {
+          return apiError(res, "VALIDATION_ERROR", { message: "capability entries cannot be empty" });
+        }
+        if (trimmed.length > 32) {
+          return apiError(res, "VALIDATION_ERROR", { message: "capability entries must be 32 characters or fewer" });
+        }
+        if (seen.has(trimmed)) {
+          return apiError(res, "VALIDATION_ERROR", { message: "capabilities must not contain duplicate entries" });
+        }
+        seen.add(trimmed);
+        trimmedCaps.push(trimmed);
+      }
+      capabilities = trimmedCaps;
     }
 
     let stellarAddress = "";
     if (b.stellarAddress !== undefined) {
       if (typeof b.stellarAddress !== "string") {
-        return json(res, { error: "stellarAddress must be a string" }, 400);
+        return apiError(res, "VALIDATION_ERROR", { message: "stellarAddress must be a string" });
       }
       stellarAddress = b.stellarAddress;
     }
@@ -709,44 +1079,52 @@ export async function createApiServer(options: ServerOptions) {
     const urlObj = new URL(req.url ?? "", "http://localhost");
     const match = urlObj.pathname.match(/^\/agents\/([^/]+)\/activity$/);
     const agentId = match?.[1];
-    if (!agentId) return json(res, { error: "invalid agent id in path" }, 400);
+    if (!agentId) return apiError(res, "INVALID_PATH_PARAM");
     const allowed = await authorizationService.canAccessAgent(ctx, agentId);
-    if (!allowed) return json(res, { error: "not found" }, 404);
+    if (!allowed) return apiError(res, "AGENT_NOT_FOUND");
     const limit = Math.max(1, Math.min(100, Number(urlObj.searchParams.get("limit") ?? 50) || 50));
-    const activity = await store.listByAgent(agentId, limit);
-    return json(res, { agentId, activity });
+    const offset = Math.max(0, Number(urlObj.searchParams.get("offset") ?? 0) || 0);
+    const all = await store.listByAgent(agentId, limit + 1, offset);
+    const activity = all.slice(0, limit);
+    const hasMore = all.length > limit && !isOffsetAtCeiling(offset);
+    return json(res, { agentId, activity, hasMore });
   }
 
   async function handleListApprovals(ctx: RequestContext, req: any, res: any) {
     const urlObj = new URL(req.url ?? "", "http://localhost");
-    const statusFilter = urlObj.searchParams.get("status") ?? undefined;
-    const all = await approvals.listByOwner(ctx.ownerId!, 200);
-    const filtered = statusFilter
-      ? all.filter((r) => r.status === statusFilter).slice(0, 50)
-      : all.slice(0, 50);
-    return json(res, { approvals: filtered });
+    const statusFilter = parseStatusFilter(urlObj.searchParams.get("status"), APPROVAL_STATUSES);
+    if (!statusFilter.ok) return apiError(res, "VALIDATION_ERROR", { message: statusFilter.error });
+    const limit = Math.max(1, Math.min(200, Number(urlObj.searchParams.get("limit") ?? 50) || 50));
+    const offset = Math.max(0, Number(urlObj.searchParams.get("offset") ?? 0) || 0);
+    const rows = await approvals.listByOwner(ctx.ownerId!, limit, offset, statusFilter.status);
+    const total = await approvals.countByOwner(ctx.ownerId!, statusFilter.status);
+    // `truncated`: more matching rows exist beyond this page.
+    // `hasMore`: the client can actually fetch them (offset ceiling ends pagination).
+    const truncated = offset + rows.length < total;
+    const hasMore = truncated && !isOffsetAtCeiling(offset);
+    return json(res, { approvals: rows, hasMore, truncated, total });
   }
 
   async function handleGetApproval(ctx: RequestContext, req: any, res: any) {
     const urlObj = new URL(req.url ?? "", "http://localhost");
     const match = urlObj.pathname.match(/^\/approvals\/([^/]+)$/);
     const approvalId = match?.[1];
-    if (!approvalId) return json(res, { error: "invalid approval id in path" }, 400);
+    if (!approvalId) return apiError(res, "INVALID_PATH_PARAM");
     const canAccess = await authorizationService.canAccessApproval(ctx, approvalId);
-    if (!canAccess) return json(res, { error: "not found" }, 404);
+    if (!canAccess) return apiError(res, "APPROVAL_NOT_FOUND");
     const approval = await approvals.get(approvalId);
-    if (!approval) return json(res, { error: "not found" }, 404);
+    if (!approval) return apiError(res, "APPROVAL_NOT_FOUND");
     return json(res, { approval });
   }
 
 
   async function handleGetPolicy(ctx: RequestContext, req: any, res: any) {
     const agentId = extractAgentIdFromPolicyUrl(req.url);
-    if (!agentId) return json(res, { error: "invalid agent id in path" }, 400);
+    if (!agentId) return apiError(res, "INVALID_PATH_PARAM");
 
-    if (!(await agentExists(agentId))) return json(res, { error: "agent not found" }, 404);
+    if (!(await agentExists(agentId))) return apiError(res, "AGENT_NOT_FOUND");
     const canAccess = await authorizationService.canAccessAgent(ctx, agentId);
-    if (!canAccess) return json(res, { error: "not found" }, 404);
+    if (!canAccess) return apiError(res, "AGENT_NOT_FOUND");
 
     const metadata = await policyConfigStore.getWithMetadata(agentId);
     if (metadata) {
@@ -763,27 +1141,27 @@ export async function createApiServer(options: ServerOptions) {
 
   async function handlePutPolicy(ctx: RequestContext, req: any, res: any) {
     const agentId = extractAgentIdFromPolicyUrl(req.url);
-    if (!agentId) return json(res, { error: "invalid agent id in path" }, 400);
+    if (!agentId) return apiError(res, "INVALID_PATH_PARAM");
 
-    if (!(await agentExists(agentId))) return json(res, { error: "agent not found" }, 404);
+    if (!(await agentExists(agentId))) return apiError(res, "AGENT_NOT_FOUND");
     const canAccess = await authorizationService.canAccessAgent(ctx, agentId);
-    if (!canAccess) return json(res, { error: "not found" }, 404);
+    if (!canAccess) return apiError(res, "AGENT_NOT_FOUND");
 
     let body: unknown;
     try {
       const text = await readBody(req);
       body = JSON.parse(text);
     } catch {
-      return json(res, { error: "invalid JSON body" }, 400);
+      return apiError(res, "INVALID_JSON");
     }
 
     if (typeof body !== "object" || body === null) {
-      return json(res, { error: "policy must be an object" }, 400);
+      return apiError(res, "VALIDATION_ERROR", { message: "policy must be an object" });
     }
 
     const validation = validatePolicyRules(body);
     if (!validation.valid) {
-      return json(res, { error: "invalid policy", details: validation.errors }, 400);
+      return apiError(res, "VALIDATION_ERROR", { message: "invalid policy", details: validation.errors });
     }
 
     const normalized = normalizePolicyRules(body as Partial<PolicyRules>);
@@ -801,11 +1179,11 @@ export async function createApiServer(options: ServerOptions) {
     const urlObj = new URL(req.url ?? "", "http://localhost");
     const match = urlObj.pathname.match(/^\/agents\/([^/]+)$/);
     const agentId = match?.[1];
-    if (!agentId) return json(res, { error: "invalid agent id in path" }, 400);
+    if (!agentId) return apiError(res, "INVALID_PATH_PARAM");
     const allowed = await authorizationService.canAccessAgent(ctx, agentId);
-    if (!allowed) return json(res, { error: "not found" }, 404);
+    if (!allowed) return apiError(res, "AGENT_NOT_FOUND");
     const agent = await agentStore.getForOwner(agentId, ctx.ownerId!);
-    if (!agent) return json(res, { error: "not found" }, 404);
+    if (!agent) return apiError(res, "AGENT_NOT_FOUND");
     return json(res, {
       id: agent.id,
       displayName: agent.displayName,
@@ -824,9 +1202,9 @@ export async function createApiServer(options: ServerOptions) {
     const urlObj = new URL(req.url ?? "", "http://localhost");
     const match = urlObj.pathname.match(/^\/agents\/([^/]+)\/spending$/);
     const agentId = match?.[1];
-    if (!agentId) return json(res, { error: "invalid agent id in path" }, 400);
+    if (!agentId) return apiError(res, "INVALID_PATH_PARAM");
     const allowed = await authorizationService.canAccessAgent(ctx, agentId);
-    if (!allowed) return json(res, { error: "not found" }, 404);
+    if (!allowed) return apiError(res, "AGENT_NOT_FOUND");
     const rules = await getRules(agentId);
     const spending: Record<string, { used: number; limit: string; remaining: number }> = {};
     for (const asset of Object.keys(rules.dailySpendingLimit)) {
@@ -848,11 +1226,11 @@ export async function createApiServer(options: ServerOptions) {
     const match = urlObj.pathname.match(/^\/agents\/([^/]+)\/activity\/([^/]+)$/);
     const agentId = match?.[1];
     const activityId = match?.[2];
-    if (!agentId || !activityId) return json(res, { error: "invalid path" }, 400);
+    if (!agentId || !activityId) return apiError(res, "INVALID_PATH_PARAM");
     const allowed = await authorizationService.canAccessAgent(ctx, agentId);
-    if (!allowed) return json(res, { error: "not found" }, 404);
+    if (!allowed) return apiError(res, "AGENT_NOT_FOUND");
     const activity = await store.getForOwner(activityId, ctx.ownerId!);
-    if (!activity) return json(res, { error: "not found" }, 404);
+    if (!activity) return apiError(res, "ACTIVITY_NOT_FOUND");
     return json(res, { activity });
   }
 
@@ -860,48 +1238,63 @@ export async function createApiServer(options: ServerOptions) {
     const urlObj = new URL(req.url ?? "", "http://localhost");
     const match = urlObj.pathname.match(/^\/agents\/([^/]+)\/approvals$/);
     const agentId = match?.[1];
-    if (!agentId) return json(res, { error: "invalid agent id in path" }, 400);
+    if (!agentId) return apiError(res, "INVALID_PATH_PARAM");
     const allowed = await authorizationService.canAccessAgent(ctx, agentId);
-    if (!allowed) return json(res, { error: "not found" }, 404);
-    const statusFilter = urlObj.searchParams.get("status") ?? undefined;
-    const all = await approvals.listByAgent(agentId, 200);
-    const filtered = statusFilter ? all.filter((r) => r.status === statusFilter).slice(0, 50) : all.slice(0, 50);
-    return json(res, { agentId, approvals: filtered });
+    if (!allowed) return apiError(res, "AGENT_NOT_FOUND");
+    const statusFilter = parseStatusFilter(urlObj.searchParams.get("status"), APPROVAL_STATUSES);
+    if (!statusFilter.ok) return apiError(res, "VALIDATION_ERROR", { message: statusFilter.error });
+    const limit = Math.max(1, Math.min(100, Number(urlObj.searchParams.get("limit") ?? 50) || 50));
+    const offset = Math.max(0, Number(urlObj.searchParams.get("offset") ?? 0) || 0);
+    const rows =
+      statusFilter.status === undefined
+        ? await approvals.listByAgent(agentId, limit + 1, offset)
+        : await approvals.listByStatus(agentId, statusFilter.status, limit + 1, offset);
+    const page = rows.slice(0, limit);
+    const hasMore = rows.length > limit && !isOffsetAtCeiling(offset);
+    return json(res, { agentId, approvals: page, hasMore });
   }
 
   async function handleUpdateAgentStatus(ctx: RequestContext, req: any, res: any) {
     const urlObj = new URL(req.url ?? "", "http://localhost");
     const match = urlObj.pathname.match(/^\/agents\/([^/]+)\/status$/);
     const agentId = match?.[1];
-    if (!agentId) return json(res, { error: "invalid agent id in path" }, 400);
+    if (!agentId) return apiError(res, "INVALID_PATH_PARAM");
     const canChange = await authorizationService.canChangeAgentStatus(ctx, agentId);
-    if (!canChange) return json(res, { error: "not found" }, 404);
+    if (!canChange) return apiError(res, "AGENT_NOT_FOUND");
     let body: unknown;
     try {
       const text = await readBody(req);
       body = text ? JSON.parse(text) : {};
     } catch {
-      return json(res, { error: "invalid JSON body" }, 400);
+      return apiError(res, "INVALID_JSON");
     }
-    const status = (body as any)?.status;
-    if (!["active", "paused", "disabled"].includes(status)) {
-      return json(res, { error: "invalid status" }, 400);
+    const status = (body as { status?: unknown })?.status;
+    if (status !== "active" && status !== "paused" && status !== "disabled") {
+      return apiError(res, "VALIDATION_ERROR", { message: "status must be one of: active, paused, disabled" });
     }
-    const agent = await agentStore.update(agentId, { status: status as any });
-    if (!agent) return json(res, { error: "not found" }, 404);
-    return json(res, { id: agent.id, status: agent.status });
+    const result = await agentStore.transitionStatus(agentId, status);
+    if (!result.updated) {
+      if (result.reason === "not_found") return apiError(res, "AGENT_NOT_FOUND");
+      return apiError(res, "AGENT_STATUS_INVALID_TRANSITION", {
+        details: { currentStatus: result.currentStatus, requestedStatus: status },
+      });
+    }
+    return json(res, { id: result.agent.id, status: result.agent.status });
   }
 
   async function handleListSchedules(ctx: RequestContext, req: any, res: any) {
     const urlObj = new URL(req.url ?? "", "http://localhost");
     const match = urlObj.pathname.match(/^\/agents\/([^/]+)\/schedules$/);
     const agentId = match?.[1];
-    if (!agentId) return json(res, { error: "invalid agent id in path" }, 400);
+    if (!agentId) return apiError(res, "INVALID_PATH_PARAM");
     const allowed = await authorizationService.canAccessAgent(ctx, agentId);
-    if (!allowed) return json(res, { error: "not found" }, 404);
+    if (!allowed) return apiError(res, "AGENT_NOT_FOUND");
     const limit = Math.max(1, Math.min(100, Number(urlObj.searchParams.get("limit") ?? 50) || 50));
-    const all = await schedules.listByAgent(agentId, limit);
-    return json(res, { agentId, schedules: all });
+    const offset = Math.max(0, Number(urlObj.searchParams.get("offset") ?? 0) || 0);
+    const all = await schedules.listByAgent(agentId, limit + 1, offset);
+    const page = all.slice(0, limit);
+    const hasMore = all.length > limit && !isOffsetAtCeiling(offset);
+    return json(res, { agentId, schedules: page, hasMore });
   }
 
   async function handleGetSchedule(ctx: RequestContext, req: any, res: any) {
@@ -909,12 +1302,12 @@ export async function createApiServer(options: ServerOptions) {
     const match = urlObj.pathname.match(/^\/agents\/([^/]+)\/schedules\/([^/]+)$/);
     const agentId = match?.[1];
     const scheduleId = match?.[2];
-    if (!agentId || !scheduleId) return json(res, { error: "invalid path" }, 400);
+    if (!agentId || !scheduleId) return apiError(res, "INVALID_PATH_PARAM");
     const allowed = await authorizationService.canAccessAgent(ctx, agentId);
-    if (!allowed) return json(res, { error: "not found" }, 404);
+    if (!allowed) return apiError(res, "AGENT_NOT_FOUND");
     const schedule = await schedules.get(scheduleId);
     if (!schedule || schedule.ownerId !== ctx.ownerId!) {
-      return json(res, { error: "not found" }, 404);
+      return apiError(res, "SCHEDULE_NOT_FOUND");
     }
     return json(res, { schedule });
   }
@@ -923,16 +1316,16 @@ export async function createApiServer(options: ServerOptions) {
     const urlObj = new URL(req.url ?? "", "http://localhost");
     const match = urlObj.pathname.match(/^\/agents\/([^/]+)\/schedules$/);
     const agentId = match?.[1];
-    if (!agentId) return json(res, { error: "invalid agent id in path" }, 400);
+    if (!agentId) return apiError(res, "INVALID_PATH_PARAM");
     const canCreate = await authorizationService.canCreateSchedule(ctx, agentId);
-    if (!canCreate) return json(res, { error: "not found" }, 404);
+    if (!canCreate) return apiError(res, "AGENT_NOT_FOUND");
 
     let body: unknown;
     try {
       const text = await readBody(req);
       body = text ? JSON.parse(text) : {};
     } catch {
-      return json(res, { error: "invalid JSON body" }, 400);
+      return apiError(res, "INVALID_JSON");
     }
 
     const intent = (body as any)?.intent;
@@ -943,12 +1336,12 @@ export async function createApiServer(options: ServerOptions) {
 
     const intentValidation = validateScheduleIntent(intent);
     if (!intentValidation.valid) {
-      return json(res, { error: intentValidation.error }, 400);
+      return apiError(res, "VALIDATION_ERROR", { message: intentValidation.error });
     }
 
     const exprValidation = validateScheduleExpression(scheduleExpression, timezone);
     if (!exprValidation.valid) {
-      return json(res, { error: exprValidation.error }, 400);
+      return apiError(res, "VALIDATION_ERROR", { message: exprValidation.error });
     }
 
     const now = new Date().toISOString();
@@ -962,6 +1355,7 @@ export async function createApiServer(options: ServerOptions) {
       timezone,
       nextRunAt: exprValidation.nextRunAt ?? now,
       lastRunAt: null,
+      lastStartedAt: null,
       createdAt: now,
       updatedAt: now,
     });
@@ -974,26 +1368,26 @@ export async function createApiServer(options: ServerOptions) {
     const match = urlObj.pathname.match(/^\/agents\/([^/]+)\/schedules\/([^/]+)$/);
     const agentId = match?.[1];
     const scheduleId = match?.[2];
-    if (!agentId || !scheduleId) return json(res, { error: "invalid path" }, 400);
+    if (!agentId || !scheduleId) return apiError(res, "INVALID_PATH_PARAM");
     const canUpdate = await authorizationService.canUpdateSchedule(ctx, scheduleId);
-    if (!canUpdate) return json(res, { error: "not found" }, 404);
+    if (!canUpdate) return apiError(res, "AGENT_NOT_FOUND");
 
     let body: unknown;
     try {
       const text = await readBody(req);
       body = text ? JSON.parse(text) : {};
     } catch {
-      return json(res, { error: "invalid JSON body" }, 400);
+      return apiError(res, "INVALID_JSON");
     }
 
     const schedule = await schedules.get(scheduleId);
-    if (!schedule) return json(res, { error: "not found" }, 404);
+    if (!schedule) return apiError(res, "SCHEDULE_NOT_FOUND");
 
     const patch: any = {};
     if ((body as any)?.scheduleExpression !== undefined) {
       const { validateScheduleExpression } = await import("@4evergent/database");
       const result = validateScheduleExpression((body as any)?.scheduleExpression, schedule.timezone);
-      if (!result.valid) return json(res, { error: result.error }, 400);
+      if (!result.valid) return apiError(res, "VALIDATION_ERROR", { message: result.error });
       patch.scheduleExpression = (body as any).scheduleExpression;
       patch.nextRunAt = result.nextRunAt ?? schedule.nextRunAt;
     }
@@ -1007,11 +1401,11 @@ export async function createApiServer(options: ServerOptions) {
     const match = urlObj.pathname.match(/^\/agents\/([^/]+)\/schedules\/([^/]+)$/);
     const agentId = match?.[1];
     const scheduleId = match?.[2];
-    if (!agentId || !scheduleId) return json(res, { error: "invalid path" }, 400);
+    if (!agentId || !scheduleId) return apiError(res, "INVALID_PATH_PARAM");
     const canDelete = await authorizationService.canDeleteSchedule(ctx, scheduleId);
-    if (!canDelete) return json(res, { error: "not found" }, 404);
+    if (!canDelete) return apiError(res, "AGENT_NOT_FOUND");
     const deleted = await schedules.delete(scheduleId);
-    if (!deleted) return json(res, { error: "not found" }, 404);
+    if (!deleted) return apiError(res, "SCHEDULE_NOT_FOUND");
     return json(res, { deleted: true });
   }
 
@@ -1021,7 +1415,7 @@ export async function createApiServer(options: ServerOptions) {
     const agentId = match?.[1];
     const scheduleId = match?.[2];
     const action = match?.[3] as "pause" | "resume" | "disable";
-    if (!agentId || !scheduleId || !action) return json(res, { error: "invalid path" }, 400);
+    if (!agentId || !scheduleId || !action) return apiError(res, "INVALID_PATH_PARAM");
 
     let allowed: boolean;
     if (action === "pause") {
@@ -1031,10 +1425,14 @@ export async function createApiServer(options: ServerOptions) {
     } else {
       allowed = await authorizationService.canDisableSchedule(ctx, scheduleId);
     }
-    if (!allowed) return json(res, { error: "not found" }, 404);
+    if (!allowed) return apiError(res, "AGENT_NOT_FOUND");
 
     const schedule = await schedules.get(scheduleId);
-    if (!schedule) return json(res, { error: "not found" }, 404);
+    if (!schedule) return apiError(res, "SCHEDULE_NOT_FOUND");
+
+    if (!SCHEDULE_TRANSITIONS[schedule.status]?.includes(action)) {
+      return apiError(res, "SCHEDULE_INVALID_TRANSITION", { message: `cannot ${action} schedule in status '${schedule.status}'` });
+    }
 
     const status = action === "pause" ? "paused" : action === "resume" ? "active" : "disabled";
     const updated = await schedules.update(scheduleId, { status });
@@ -1045,32 +1443,35 @@ export async function createApiServer(options: ServerOptions) {
     const urlObj = new URL(req.url ?? "", "http://localhost");
     const match = urlObj.pathname.match(/^\/agents\/([^/]+)\/executions$/);
     const agentId = match?.[1];
-    if (!agentId) return json(res, { error: "invalid agent id in path" }, 400);
+    if (!agentId) return apiError(res, "INVALID_PATH_PARAM");
     const allowed = await authorizationService.canAccessAgent(ctx, agentId);
-    if (!allowed) return json(res, { error: "not found" }, 404);
+    if (!allowed) return apiError(res, "AGENT_NOT_FOUND");
     const limit = Math.max(1, Math.min(100, Number(urlObj.searchParams.get("limit") ?? 50) || 50));
-    const all = await executionStore.listByAgent(agentId, limit);
-    return json(res, { agentId, executions: all });
+    const offset = Math.max(0, Number(urlObj.searchParams.get("offset") ?? 0) || 0);
+    const all = await executionStore.listByAgent(agentId, limit + 1, offset);
+    const executions = all.slice(0, limit);
+    const hasMore = all.length > limit && !isOffsetAtCeiling(offset);
+    return json(res, { agentId, executions, hasMore });
   }
 
   async function handleExecutionDetail(ctx: RequestContext, req: any, res: any) {
     const urlObj = new URL(req.url ?? "", "http://localhost");
     const match = urlObj.pathname.match(/^\/executions\/([^/]+)$/);
     const executionId = match?.[1];
-    if (!executionId) return json(res, { error: "invalid execution id in path" }, 400);
+    if (!executionId) return apiError(res, "INVALID_PATH_PARAM");
     const execution = await executionStore.getForOwner(executionId, ctx.ownerId!);
-    if (!execution) return json(res, { error: "not found" }, 404);
+    if (!execution) return apiError(res, "EXECUTION_NOT_FOUND");
     return json(res, { execution });
   }
 
   async function handleQueueStatus(ctx: RequestContext, _req: any, res: any) {
     if (!executionQueue) {
-      return json(res, { error: "execution queue not enabled" }, 404);
+      return apiError(res, "EXECUTION_QUEUE_DISABLED");
     }
-    const all = await executionStore.listByOwner(ctx.ownerId!, 200);
+    const execCounts = await executionStore.countByOwner(ctx.ownerId!);
     const byStatus: Record<string, number> = {};
-    for (const e of all) {
-      byStatus[e.status] = (byStatus[e.status] ?? 0) + 1;
+    for (const [status, count] of Object.entries(execCounts)) {
+      if (count > 0) byStatus[status] = count;
     }
     return json(res, {
       running: executionQueue.isRunning(),
@@ -1081,8 +1482,7 @@ export async function createApiServer(options: ServerOptions) {
 
   async function handleGetOverviewAttention(ctx: RequestContext, _req: any, res: any) {
     const ownerId = ctx.ownerId!;
-    const pendingApprovals = (await approvals.listByOwner(ownerId, 200))
-      .filter((a) => a.status === "pending_approval").length;
+    const pendingApprovals = await approvals.countByOwner(ownerId, "pending_approval");
     const execCounts: Record<ExecutionStatus, number> =
       await executionStore.countByOwner(ownerId);
     return json(res, {
@@ -1102,44 +1502,50 @@ export async function createApiServer(options: ServerOptions) {
   async function handleListExecutions(ctx: RequestContext, req: any, res: any) {
     const urlObj = new URL(req.url ?? "", "http://localhost");
     const limit = Math.max(1, Math.min(100, Number(urlObj.searchParams.get("limit") ?? 50) || 50));
-    const executions = await executionStore.listByOwner(ctx.ownerId!, limit);
-    return json(res, { executions });
+    const offset = Math.max(0, Number(urlObj.searchParams.get("offset") ?? 0) || 0);
+    const all = await executionStore.listByOwner(ctx.ownerId!, limit + 1, offset);
+    const executions = all.slice(0, limit);
+    const hasMore = all.length > limit && !isOffsetAtCeiling(offset);
+    return json(res, { executions, hasMore });
   }
 
   async function handleListActivity(ctx: RequestContext, req: any, res: any) {
     const urlObj = new URL(req.url ?? "", "http://localhost");
     const limit = Math.max(1, Math.min(100, Number(urlObj.searchParams.get("limit") ?? 50) || 50));
-    const activity = await store.listByOwner(ctx.ownerId!, limit);
-    return json(res, { activity });
+    const offset = Math.max(0, Number(urlObj.searchParams.get("offset") ?? 0) || 0);
+    const all = await store.listByOwner(ctx.ownerId!, limit + 1, offset);
+    const activity = all.slice(0, limit);
+    const hasMore = all.length > limit && !isOffsetAtCeiling(offset);
+    return json(res, { activity, hasMore });
   }
 
   async function handleRetryExecution(ctx: RequestContext, req: any, res: any) {
     const urlObj = new URL(req.url ?? "", "http://localhost");
     const match = urlObj.pathname.match(/^\/executions\/([^/]+)\/retry$/);
     const executionId = match?.[1];
-    if (!executionId) return json(res, { error: "invalid execution id in path" }, 400);
+    if (!executionId) return apiError(res, "INVALID_PATH_PARAM");
 
     if (!executionQueue) {
-      return json(res, { error: "execution queue not enabled" }, 404);
+      return apiError(res, "EXECUTION_QUEUE_DISABLED");
     }
 
     const execution = await executionStore.getForOwner(executionId, ctx.ownerId!);
-    if (!execution) return json(res, { error: "not found" }, 404);
+    if (!execution) return apiError(res, "EXECUTION_NOT_FOUND");
 
     if (execution.status !== "failed" && execution.status !== "dead_letter") {
-      return json(res, { error: `cannot retry execution in status '${execution.status}'` }, 409);
+      return apiError(res, "INVALID_EXECUTION_STATE", { message: `cannot retry execution in status '${execution.status}'` });
     }
 
     const maxRetries = executionQueue["retryPolicy"]?.maxRetries ?? 3;
     if (execution.attempt >= maxRetries) {
-      return json(res, { error: `max retry attempts (${maxRetries}) reached` }, 409);
+      return apiError(res, "MAX_RETRIES_REACHED", { message: `max retry attempts (${maxRetries}) reached` });
     }
 
     const result = await executionQueue.retry(executionId, maxRetries);
-    if (result.status === "not_found") return json(res, { error: "not found" }, 404);
-    if (result.status === "invalid_state") return json(res, { error: `cannot retry execution in status '${execution.status}'` }, 409);
-    if (result.status === "max_retries_reached") return json(res, { error: `max retry attempts (${maxRetries}) reached` }, 409);
-    if (result.status === "conflict") return json(res, { error: "execution state changed; please refresh" }, 409);
+    if (result.status === "not_found") return apiError(res, "EXECUTION_NOT_FOUND");
+    if (result.status === "invalid_state") return apiError(res, "INVALID_EXECUTION_STATE", { message: `cannot retry execution in status '${execution.status}'` });
+    if (result.status === "max_retries_reached") return apiError(res, "MAX_RETRIES_REACHED", { message: `max retry attempts (${maxRetries}) reached` });
+    if (result.status === "conflict") return apiError(res, "EXECUTION_CONFLICT");
 
     return json(res, { execution: result.execution, message: "execution queued for retry" });
   }
@@ -1148,58 +1554,70 @@ export async function createApiServer(options: ServerOptions) {
     const urlObj = new URL(req.url ?? "", "http://localhost");
     const match = urlObj.pathname.match(/^\/executions\/([^/]+)\/cancel$/);
     const executionId = match?.[1];
-    if (!executionId) return json(res, { error: "invalid execution id in path" }, 400);
+    if (!executionId) return apiError(res, "INVALID_PATH_PARAM");
 
     if (!executionQueue) {
-      return json(res, { error: "execution queue not enabled" }, 404);
+      return apiError(res, "EXECUTION_QUEUE_DISABLED");
     }
 
     const execution = await executionStore.getForOwner(executionId, ctx.ownerId!);
-    if (!execution) return json(res, { error: "not found" }, 404);
+    if (!execution) return apiError(res, "EXECUTION_NOT_FOUND");
 
     if (execution.status !== "queued" && execution.status !== "executing") {
-      return json(res, { error: `cannot cancel execution in status '${execution.status}'` }, 409);
+      return apiError(res, "INVALID_EXECUTION_STATE", { message: `cannot cancel execution in status '${execution.status}'` });
     }
 
     const result = await executionQueue.cancel(executionId);
-    if (result.status === "not_found") return json(res, { error: "not found" }, 404);
-    if (result.status === "invalid_state") return json(res, { error: `cannot cancel execution in status '${execution.status}'` }, 409);
-    if (result.status === "conflict") return json(res, { error: "execution state changed; please refresh" }, 409);
+    if (result.status === "not_found") return apiError(res, "EXECUTION_NOT_FOUND");
+    if (result.status === "invalid_state") {
+      const current = await executionStore.get(executionId);
+      const currentStatus = current?.status ?? execution.status;
+      let msg: string;
+      if (currentStatus !== "executing") {
+        msg = `cannot cancel execution in status '${currentStatus}'`;
+      } else if (result.reason === "not_in_flight") {
+        msg = "cannot cancel execution: execution is not actively running on this worker";
+      } else {
+        msg = "cannot cancel execution: pipeline has already begun submitting transaction";
+      }
+      return apiError(res, "INVALID_EXECUTION_STATE", { message: msg });
+    }
+    if (result.status === "conflict") return apiError(res, "EXECUTION_CONFLICT");
 
     return json(res, { execution: result.execution, message: "execution cancelled" });
   }
 
   async function handleIntent(ctx: RequestContext, req: any, res: any) {
     const agentId = extractAgentId(req.url);
-    if (!agentId) return json(res, { error: "invalid agent id in path" }, 400);
+    if (!agentId) return apiError(res, "INVALID_PATH_PARAM");
 
     let body: unknown;
     try {
       const text = await readBody(req);
       body = JSON.parse(text);
     } catch {
-      return json(res, { error: "invalid JSON body" }, 400);
+      return apiError(res, "INVALID_JSON");
     }
 
     if (isRawTransaction(body)) {
-      return json(res, { error: "raw XDR and transaction blobs are not accepted; submit a typed intent" }, 400);
+      return apiError(res, "RAW_TRANSACTION_REJECTED");
     }
 
     let intent: AgentIntent;
     try {
       intent = parseIntent(body);
     } catch (e) {
-      return json(res, { error: (e as Error).message }, 400);
+      return apiError(res, "VALIDATION_ERROR", { message: (e as Error).message });
     }
 
     const validation = IntentValidator.validate(intent);
     if (!validation.valid) {
-      return json(res, { error: `Intent validation failed: ${validation.error}` }, 400);
+      return apiError(res, "VALIDATION_ERROR", { message: `Intent validation failed: ${validation.error}` });
     }
 
-    if (!(await agentExists(agentId))) return json(res, { error: "agent not found" }, 404);
+    if (!(await agentExists(agentId))) return apiError(res, "AGENT_NOT_FOUND");
     const canSubmit = await authorizationService.canSubmitIntent(ctx, agentId);
-    if (!canSubmit) return json(res, { error: "not found" }, 404);
+    if (!canSubmit) return apiError(res, "AGENT_NOT_FOUND");
 
     // Agent status admission boundary: only ACTIVE agents accept NEW intents.
     // Reads the CURRENT status from the persistent agent store so a paused or
@@ -1207,9 +1625,9 @@ export async function createApiServer(options: ServerOptions) {
     // or execution-queue entries are created. In-flight executions are not
     // affected — this gate only applies at intent submission time.
     const agent = await agentStore.get(agentId);
-    if (!agent) return json(res, { error: "agent not found" }, 404);
+    if (!agent) return apiError(res, "AGENT_NOT_FOUND");
     if (agent.status !== "active") {
-      return json(res, { error: `agent is ${agent.status}; new intents are rejected` }, 409);
+      return apiError(res, "AGENT_NOT_ACTIVE", { message: `agent is ${agent.status}; new intents are rejected` });
     }
 
     // Idempotency key from header (scoped to owner+agent)
@@ -1217,7 +1635,7 @@ export async function createApiServer(options: ServerOptions) {
     if (idempotencyKey) {
       // Enforce bounded key length to prevent abuse
       if (idempotencyKey.length > 256) {
-        return json(res, { error: "Idempotency-Key must be 256 characters or fewer" }, 400);
+        return apiError(res, "IDEMPOTENCY_KEY_INVALID");
       }
       const existing = await store.getByIdempotencyKey(ctx.ownerId!, agentId, idempotencyKey);
       if (existing) {
@@ -1225,7 +1643,7 @@ export async function createApiServer(options: ServerOptions) {
         const existingIntentJson = JSON.stringify(existing.intent);
         const newIntentJson = JSON.stringify(intent);
         if (existingIntentJson !== newIntentJson) {
-          return json(res, { error: "Idempotency-Key already used with a different intent" }, 409);
+          return apiError(res, "IDEMPOTENCY_CONFLICT");
         }
         // Duplicate request → return existing activity (idempotent success)
         return json(res, toIntentResponse(existing), 200);
@@ -1323,18 +1741,18 @@ export async function createApiServer(options: ServerOptions) {
 
   async function handleApprove(ctx: RequestContext, req: any, res: any) {
     const approvalId = extractApprovalId(req.url);
-    if (!approvalId) return json(res, { error: "invalid approval id in path" }, 400);
+    if (!approvalId) return apiError(res, "INVALID_PATH_PARAM");
 
     let body: unknown = {};
     try {
       const text = await readBody(req);
       body = text ? JSON.parse(text) : {};
     } catch {
-      return json(res, { error: "invalid JSON body" }, 400);
+      return apiError(res, "INVALID_JSON");
     }
 
     if (isRawTransaction(body)) {
-      return json(res, { message: "raw XDR and transaction blobs are not accepted at the approve endpoint" }, 400);
+      return approvalError(res, "RAW_TRANSACTION_REJECTED", { approvalId, activityId: "", status: "rejected", message: "raw XDR and transaction blobs are not accepted at the approve endpoint" });
     }
 
     // Phase 28K-2: Actor from authenticated principal subject
@@ -1342,23 +1760,32 @@ export async function createApiServer(options: ServerOptions) {
 
     const approval = await approvals.get(approvalId);
     if (!approval) {
-      return json(res, toApprovalResponse(approvalId, "", "rejected", "approval not found"), 404);
+      return approvalError(res, "APPROVAL_NOT_FOUND", { approvalId, activityId: "", status: "rejected", message: "approval not found" });
     }
 
     const canApprove = await authorizationService.canApprove(ctx, approvalId);
-    if (!canApprove) return json(res, toApprovalResponse(approvalId, "", "rejected", "approval not found"), 404);
+    if (!canApprove) return approvalError(res, "APPROVAL_NOT_FOUND", { approvalId, activityId: "", status: "rejected", message: "approval not found" });
 
     const transitionError = validateApprovalTransition(approval.status, "approved");
     if (transitionError) {
-      return json(res, toApprovalResponse(approvalId, approval.activityId, approval.status, `cannot approve: ${transitionError}`), 409);
+      return approvalError(res, "APPROVAL_INVALID_STATE", { approvalId, activityId: approval.activityId, status: approval.status, message: `cannot approve: ${transitionError}` });
     }
 
     if (approval.expiresAt && new Date(approval.expiresAt) < new Date()) {
       await approvals.update(approvalId, { status: "expired", expiredAt: new Date().toISOString() });
-      return json(res, toApprovalResponse(approvalId, approval.activityId, "expired", "approval expired"), 410);
+      return approvalError(res, "APPROVAL_EXPIRED", { approvalId, activityId: approval.activityId, status: "expired", message: "approval expired" });
     }
 
-    await approvals.update(approvalId, { status: "approved", approvedAt: new Date().toISOString(), approver: approver ?? null });
+    // Atomic claim: pending_approval → approved in one conditional step.
+    // A concurrent approve/reject that lands first wins; this request then
+    // gets null and returns 409 instead of enqueueing a second execution.
+    // (The transition check above still rejects a SEQUENTIAL second decision
+    // — e.g. approve after reject — with APPROVAL_INVALID_STATE.)
+    const claimed = await approvals.updateIfStatus(approvalId, "pending_approval", { status: "approved", approvedAt: new Date().toISOString(), approver: approver ?? null });
+    if (!claimed) {
+      const current = await approvals.get(approvalId);
+      return approvalError(res, "APPROVAL_CONFLICT", { approvalId, activityId: approval.activityId, status: current?.status ?? approval.status, message: `approval already decided (now ${current?.status ?? approval.status}); refresh before retrying` });
+    }
 
     // Enqueue for execution via the persistent execution queue.
     // If the queue is not enabled, fall back to setImmediate (Phase 8 behavior).
@@ -1405,34 +1832,43 @@ export async function createApiServer(options: ServerOptions) {
 
   async function handleReject(ctx: RequestContext, req: any, res: any) {
     const approvalId = extractApprovalId(req.url);
-    if (!approvalId) return json(res, { error: "invalid approval id in path" }, 400);
+    if (!approvalId) return apiError(res, "INVALID_PATH_PARAM");
 
     let body: unknown = {};
     try {
       const text = await readBody(req);
       body = text ? JSON.parse(text) : {};
     } catch {
-      return json(res, { error: "invalid JSON body" }, 400);
+      return apiError(res, "INVALID_JSON");
     }
 
     if (isRawTransaction(body)) {
-      return json(res, { message: "raw XDR and transaction blobs are not accepted at the reject endpoint" }, 400);
+      return approvalError(res, "RAW_TRANSACTION_REJECTED", { approvalId, activityId: "", status: "rejected", message: "raw XDR and transaction blobs are not accepted at the reject endpoint" });
     }
 
     const approval = await approvals.get(approvalId);
     if (!approval) {
-      return json(res, toApprovalResponse(approvalId, "", "rejected", "approval not found"), 404);
+      return approvalError(res, "APPROVAL_NOT_FOUND", { approvalId, activityId: "", status: "rejected", message: "approval not found" });
     }
 
     const canReject = await authorizationService.canReject(ctx, approvalId);
-    if (!canReject) return json(res, toApprovalResponse(approvalId, "", "rejected", "approval not found"), 404);
+    if (!canReject) return approvalError(res, "APPROVAL_NOT_FOUND", { approvalId, activityId: "", status: "rejected", message: "approval not found" });
 
     const transitionError = validateApprovalTransition(approval.status, "rejected");
     if (transitionError) {
-      return json(res, toApprovalResponse(approvalId, approval.activityId, approval.status, `cannot reject: ${transitionError}`), 409);
+      return approvalError(res, "APPROVAL_INVALID_STATE", { approvalId, activityId: approval.activityId, status: approval.status, message: `cannot reject: ${transitionError}` });
     }
 
-    await approvals.update(approvalId, { status: "rejected", rejectedAt: new Date().toISOString() });
+    // Atomic claim: pending_approval → rejected in one conditional step.
+    // A concurrent approve/reject that lands first wins; this request then
+    // gets null and returns 409 with no state change and no execution record.
+    // (The transition check above still rejects a SEQUENTIAL second decision
+    // — e.g. reject after approve — with APPROVAL_INVALID_STATE.)
+    const claimed = await approvals.updateIfStatus(approvalId, "pending_approval", { status: "rejected", rejectedAt: new Date().toISOString() });
+    if (!claimed) {
+      const current = await approvals.get(approvalId);
+      return approvalError(res, "APPROVAL_CONFLICT", { approvalId, activityId: approval.activityId, status: current?.status ?? approval.status, message: `approval already decided (now ${current?.status ?? approval.status}); refresh before retrying` });
+    }
     await store.update(approval.activityId, { status: "rejected", authorizationStatus: "denied_by_policy", error: "approval rejected by human" });
 
     return json(res, toApprovalResponse(approvalId, approval.activityId, "rejected", "approval rejected"), 200);
@@ -1451,6 +1887,13 @@ export async function createApiServer(options: ServerOptions) {
     };
   }
 
+  // Approve/reject errors keep the ApprovalResponse fields (including `message`)
+  // and add the structured `code` and `error` so every error carries a code.
+  function approvalError(res: any, code: ApiErrorCode, r: { approvalId: string; activityId: string; status: ApprovalStatus; message: string }) {
+    const def = API_ERRORS[code];
+    return json(res, { code, error: r.message, ...toApprovalResponse(r.approvalId, r.activityId, r.status, r.message) }, def.status);
+  }
+
   function toApprovalResponse(approvalId: string, activityId: string, status: ApprovalStatus, message: string): ApprovalResponse {
     return { approvalId, activityId, agentId: "", status, message };
   }
@@ -1464,24 +1907,82 @@ export async function createApiServer(options: ServerOptions) {
     // fails closed when HOST is non-loopback and API_KEYS is unset.
     listen: (port: number, host: string = "127.0.0.1") =>
       new Promise<void>((resolve) => server.listen(port, host, resolve)),
-    close: () => new Promise<void>((resolve) => {
-      if (scheduler) {
-        scheduler.stop();
-        console.log("[scheduler] stopped");
-      }
-      if (executionQueue) {
-        executionQueue.stop();
-        console.log("[execution-queue] stopped");
-      }
-      if (reconciler) {
-        reconciler.stop();
-        console.log("[reconciler] stopped");
-      }
-      // Abort lingering keep-alive connections so the server actually shuts
-      // down (Node's http close() waits for active sockets otherwise).
-      server.closeAllConnections?.();
-      server.close(() => resolve());
-    }),
+    close: (options?: { drainTimeoutMs?: number }) =>
+      new Promise<void>((resolve, reject) => {
+        // 1. Stop accepting new requests and prevent workers from claiming new work.
+        if (scheduler) {
+          scheduler.stop();
+          console.log("[scheduler] stopped");
+        }
+        if (executionQueue) {
+          executionQueue.stop();
+          console.log("[execution-queue] stopped");
+        }
+        if (reconciler) {
+          reconciler.stop();
+          console.log("[reconciler] stopped");
+        }
+        if (approvalRecovery.isRunning()) {
+          approvalRecovery.stop();
+          console.log("[approval-recovery] stopped");
+        }
+        if (retentionTimer) {
+          clearInterval(retentionTimer);
+          retentionTimer = null;
+        }
+
+        // Close idle keep-alive connections so idle sockets do not keep the server open,
+        // while allowing in-flight HTTP requests to complete.
+        server.closeIdleConnections?.();
+        const idleInterval = setInterval(() => {
+          server.closeIdleConnections?.();
+        }, 20);
+
+        let drainTimer: NodeJS.Timeout | null = null;
+        let completed = false;
+
+        const finish = () => {
+          if (completed) return;
+          completed = true;
+          clearInterval(idleInterval);
+          if (drainTimer) {
+            clearTimeout(drainTimer);
+            drainTimer = null;
+          }
+          resolve();
+        };
+
+        const drainTimeout = options?.drainTimeoutMs;
+        if (drainTimeout !== undefined && drainTimeout > 0) {
+          drainTimer = setTimeout(() => {
+            if (completed) return;
+            completed = true;
+            clearInterval(idleInterval);
+            drainTimer = null;
+            // 3. Force-close remaining connections and terminate outstanding work after timeout expires.
+            server.closeAllConnections?.();
+            executionQueue?.abortInFlight();
+            const err = new Error(`Shutdown timeout of ${drainTimeout}ms exceeded — forcing exit`);
+            err.name = "ShutdownTimeoutError";
+            reject(err);
+          }, drainTimeout);
+        }
+
+        // 2. Allow active HTTP requests and in-flight executions to finish within the configured drain timeout.
+        const httpClose = new Promise<void>((r) => {
+          server.close(() => r());
+        });
+        const queueDrain = executionQueue ? executionQueue.drain(drainTimeout) : Promise.resolve();
+
+        Promise.all([httpClose, queueDrain])
+          .then(() => {
+            finish();
+          })
+          .catch((err) => {
+            if (drainTimer) clearTimeout(drainTimer);
+            reject(err);
+          });
+      }),
     registerAgent: (agent: Agent) => {
       agents.set(agent.id, agent);
       void agentStore.create({
@@ -1501,6 +2002,7 @@ export async function createApiServer(options: ServerOptions) {
     scheduler,
     executionQueue,
     recoveryService,
+    scheduleRecoveryService,
   };
 }
 
@@ -1530,12 +2032,39 @@ function makeActivity(
   };
 }
 
+function apiError(
+  res: any,
+  code: ApiErrorCode,
+  opts: { message?: string; details?: unknown; extra?: Record<string, unknown> } = {},
+) {
+  const def = API_ERRORS[code];
+  const body: Record<string, unknown> = { code, error: opts.message ?? def.message };
+  if (opts.details !== undefined) body.details = opts.details;
+  // `extra` spreads additional top-level fields into the documented envelope,
+  // e.g. conflict details such as currentStatus/requestedStatus. Optional and
+  // unused by existing callers, so behavior is unchanged for them.
+  if (opts.extra) Object.assign(body, opts.extra);
+  return json(res, body, def.status);
+}
+
+/**
+ * Legal schedule actions per current status. No-ops (pause when paused,
+ * resume when active, disable when disabled) are rejected so callers get a
+ * signal that nothing changed. `disabled` stays reversible via resume,
+ * matching the dashboard's Resume button for disabled schedules.
+ */
+const SCHEDULE_TRANSITIONS: Record<string, ReadonlyArray<"pause" | "resume" | "disable">> = {
+  active: ["pause", "disable"],
+  paused: ["resume", "disable"],
+  disabled: ["resume"],
+};
+
 function json(res: any, body: unknown, status = 200) {
   res.writeHead(status, { "Content-Type": "application/json" });
   res.end(JSON.stringify(body));
 }
 
-function readBody(req: any): Promise<string> {
+export function readBody(req: any): Promise<string> {
   return new Promise((resolve, reject) => {
     let data = "";
     req.on("data", (chunk: Buffer) => {
@@ -1634,12 +2163,22 @@ function parseIntent(body: unknown): AgentIntent {
       };
     }
     case "contract_call":
-    case "account_settings":
       throw new Error(`intent type '${b.type}' is not yet supported by the transaction pipeline`);
+    case "account_settings": {
+      if (typeof b.setting !== "string" || b.setting.trim().length === 0) {
+        throw new Error("account_settings.setting is required");
+      }
+      if (typeof b.reason !== "string") throw new Error("account_settings.reason is required");
+      return {
+        type: "account_settings",
+        setting: b.setting,
+        value: b.value,
+        reason: b.reason,
+      };
+    }
     default:
       throw new Error(`unknown intent type: ${b.type}`);
   }
 }
 
-void randomUUID;
 void TESTNET_PASSPHRASE;
