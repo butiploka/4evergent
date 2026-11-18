@@ -27,6 +27,14 @@ import { normalizePolicyRules } from "./validation.js";
 export interface EvaluateOptions {
   /** Skip daily spending reservation (for re-evaluation in approve path). */
   skipReservation?: boolean;
+  /**
+   * Skip the approval-threshold gate. The human approval being executed
+   * already satisfies that gate; re-evaluation must check everything else
+   * (allowlist, max amount, daily limit, tx type) without re-triggering
+   * `requires_approval` for the very amount that was approved. Used only by
+   * executeApproved(); the submit path always evaluates the threshold.
+   */
+  skipApprovalThreshold?: boolean;
 }
 
 export class PolicyEngine {
@@ -168,30 +176,38 @@ export class PolicyEngine {
       }
     }
 
-    // 4. Approval threshold
-    if (amount !== null) {
-      const threshold = rules.requireHumanApprovalForAmountAbove;
-      if (threshold && compareAmounts(amount, threshold) >= 0) {
-        return decide("requires_approval", `Amount ${amount} ${asset} requires human approval (>= ${threshold})`, "approvalThreshold");
-      }
-    }
-
-    // 5. Asset allowlist
+    // 4. Allowlist — checked BEFORE the approval threshold on purpose.
+    //    An above-threshold intent to a disallowed destination/asset/contract
+    //    is denied outright, not routed to requires_approval: the allowlist
+    //    is a hard boundary, the threshold is only a "ask a human" gate for
+    //    otherwise-permitted intents. (Previously the threshold returned
+    //    first, so a disallowed intent above threshold looked approvable.)
+    // 4a. Asset allowlist
     if (rules.allowedAssets.length > 0 && !rules.allowedAssets.includes(asset)) {
       return decide("deny", `Asset '${asset}' is not in allowed_assets`, "allowedAssets");
     }
 
-    // 6. Destination allowlist (payments only)
+    // 4b. Destination allowlist (payments only)
     if (intent.type === "payment" && rules.allowedDestinations.length > 0) {
       if (!rules.allowedDestinations.includes(intent.destination)) {
         return decide("deny", `Destination '${intent.destination}' not in allowed_destinations`, "allowedDestinations");
       }
     }
 
-    // 7. Contract ID allowlist (contract calls only)
+    // 4c. Contract ID allowlist (contract calls only)
     if (intent.type === "contract_call" && rules.allowedContractIds.length > 0) {
       if (!rules.allowedContractIds.includes(intent.contractId)) {
         return decide("deny", `Contract '${intent.contractId}' not in allowed list`, "allowedContractIds");
+      }
+    }
+
+    // 5. Approval threshold — only reached for allowlisted intents.
+    //    Skipped when re-evaluating an already-approved intent
+    //    (see EvaluateOptions.skipApprovalThreshold).
+    if (amount !== null && !options?.skipApprovalThreshold) {
+      const threshold = rules.requireHumanApprovalForAmountAbove;
+      if (threshold && compareAmounts(amount, threshold) >= 0) {
+        return decide("requires_approval", `Amount ${amount} ${asset} requires human approval (>= ${threshold})`, "approvalThreshold");
       }
     }
 
