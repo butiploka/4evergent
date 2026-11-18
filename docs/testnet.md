@@ -6,6 +6,11 @@
 - **pnpm >= 9** (workspace package manager)
 - Rust toolchain (for Soroban contracts, Phase 3+)
 
+Contracts CI enforces `cargo fmt --all --check` and
+`cargo clippy --workspace --all-targets --locked -- -D warnings` from `contracts/`
+using the pinned Rust toolchain. Run both before opening a contracts PR; see
+[Working on contracts](../CONTRIBUTING.md#working-on-contracts) for setup.
+
 ## Full Testnet Execution Workflow
 
 ### 1. Install dependencies
@@ -254,6 +259,36 @@ Verified on 2026-09-28: `query` on an unknown id returned `null`; after
 `register`, `query` returned the record with `"active": true`; the fetched wasm
 sha256 equalled `83656ffddd08a22e1977b6cf129af4d6515be7e8494d843ded1aa1c0ef3f8445`.
 
+### Worker intervals
+
+The background workers poll on fixed intervals that can be tuned with environment variables (milliseconds, positive numbers only; an invalid value stops startup with a `FATAL` error):
+
+| Variable | Worker | Default |
+| --- | --- | --- |
+| `RECONCILIATION_INTERVAL_MS` | Transaction status reconciliation | `30000` |
+| `EXECUTION_QUEUE_INTERVAL_MS` | Execution queue | `10000` |
+| `SCHEDULER_INTERVAL_MS` | Schedule polling | `60000` |
+
+A faster reconciliation loop is handy for a testnet demo; a slower one reduces Horizon load. The startup log lines (`[reconciler] started, interval: ...`) show the effective value.
+
+## Transaction fees
+
+Every transaction the pipeline builds carries one configured base fee
+(`StellarTransactionBuilder`, `packages/stellar/src/transaction-builder.ts`):
+
+| Source | Value |
+| --- | --- |
+| Constructor option `baseFeeStroops` | overrides everything |
+| `STELLAR_BASE_FEE` env var (see `.env.example`) | overrides the default |
+| Default | `100` stroops — the Stellar network base fee |
+
+Previously each builder hardcoded `100000` stroops (0.01 XLM, 1000x the base
+fee). A configured value must be a positive integer number of stroops; an
+invalid value fails fast at startup. This is a static configured fee only —
+no dynamic surge pricing. The simulator still enforces `fee >=` the live
+network base fee fetched from Horizon, so a configured fee below the network
+base fee fails simulation instead of submitting.
+
 ## Safety Guards (Phase 21)
 
 - **Network validation**: Only Testnet URL + passphrase accepted. Mainnet explicitly rejected.
@@ -270,3 +305,13 @@ sha256 equalled `83656ffddd08a22e1977b6cf129af4d6515be7e8494d843ded1aa1c0ef3f844
 - Single-process architecture (no distributed workers).
 - Production authentication not implemented.
 - No live transaction has been executed by CI. All tests use deterministic mocks.
+
+## Integrating with agent-registry from TypeScript
+
+See [`soroban-integration.md`](soroban-integration.md) for a TypeScript consumer
+guide: the Rust→TS type mapping for `AgentInfo` and the `Error` enum, the
+four entry points with parameters and return shapes, the authorization model,
+and a verified `query()` snippet against the deployed contract.
+
+The CLI verification above (`stellar contract invoke -- query`) is the shell
+equivalent of the SDK call documented there.
