@@ -5,7 +5,7 @@ import type { Signer } from "./signer.js";
 import { PolicyEngine } from "@4evergent/policy";
 import { IntentValidator } from "@4evergent/agent-core";
 import { StellarAdapter } from "@4evergent/agent-core";
-import type { AgentIntent, PolicyDecision, PolicyRules, ActivityRecord } from "@4evergent/shared";
+import type { AgentIntent, AccountSettingsIntent, PolicyDecision, PolicyRules, ActivityRecord } from "@4evergent/shared";
 import {
   createActivity,
   createApproval,
@@ -21,6 +21,9 @@ export interface PipelineOptions {
   approvalStore?: ApprovalStore;
   policyRules?: Partial<PolicyRules>;
   approvalTtlSeconds?: number;
+  /** Base fee (stroops) for transactions built by this pipeline. Overrides
+   *  STELLAR_BASE_FEE; when omitted the builder defaults to 100 stroops. */
+  baseFeeStroops?: string;
   /** Shared policy resolver. When provided, pipeline resolves per-agent rules at execution time. */
   policyResolver?: (agentId: string) => Promise<PolicyRules>;
 }
@@ -31,6 +34,8 @@ export interface PipelineExecuteInput {
   idempotencyKey?: string | null;
   /** Pre-existing activity ID to update instead of creating a new ActivityRecord. */
   activityId?: string;
+  signal?: AbortSignal;
+  onBeforeSubmit?: () => void | Promise<void>;
 }
 
 export class TransactionPipeline {
@@ -46,7 +51,9 @@ export class TransactionPipeline {
   private policyResolver?: (agentId: string) => Promise<PolicyRules>;
 
   constructor(options: PipelineOptions) {
-    this.builder = new StellarTransactionBuilder();
+    this.builder = new StellarTransactionBuilder(
+      options.baseFeeStroops !== undefined ? { baseFeeStroops: options.baseFeeStroops } : {}
+    );
     this.simulator = new StellarSimulator(options.horizonUrl);
     this.submitter = new StellarSubmitter(options.horizonUrl);
     this.signer = options.signer;
@@ -60,7 +67,16 @@ export class TransactionPipeline {
   }
 
   async execute(input: PipelineExecuteInput): Promise<PipelineOutcome> {
-    const { intent, sourceAccount, idempotencyKey, activityId } = input;
+    const { intent, sourceAccount, idempotencyKey, activityId, signal } = input;
+
+    const checkAbort = () => {
+      if (signal?.aborted) {
+        const err = new Error("Execution was cancelled");
+        err.name = "AbortError";
+        throw err;
+      }
+    };
+    checkAbort();
 
     const validation = IntentValidator.validate(intent);
     if (!validation.valid) {
@@ -118,14 +134,21 @@ export class TransactionPipeline {
       };
     }
 
+    checkAbort();
+
     let tx;
     try {
       if (intent.type === "trustline") {
         tx = await this.builder.buildTrustline(sourceAccount, intent as any, this.signer.getNetworkPassphrase());
+      } else if (intent.type === "account_settings") {
+        tx = await this.builder.buildAccountSettings(sourceAccount, intent as AccountSettingsIntent, this.signer.getNetworkPassphrase());
       } else {
         tx = await this.builder.buildPayment(sourceAccount, intent as any, this.signer.getNetworkPassphrase());
       }
     } catch (e: any) {
+      if (signal?.aborted || e?.name === "AbortError") {
+        throw e;
+      }
       const activity = this.resolveActivity(activityId, agentId, ownerId, intent, decision, idempotencyKey);
       activity.status = "rejected";
       activity.error = e.message;
@@ -138,6 +161,8 @@ export class TransactionPipeline {
         activityId: activity.id,
       };
     }
+
+    checkAbort();
 
     const simResult = await this.simulator.simulate(tx);
     if (!simResult.success) {
@@ -155,10 +180,15 @@ export class TransactionPipeline {
       };
     }
 
+    checkAbort();
+
     let signedTx;
     try {
       signedTx = await this.signer.sign(tx);
     } catch (e: any) {
+      if (signal?.aborted || e?.name === "AbortError") {
+        throw e;
+      }
       const activity = this.resolveActivity(activityId, agentId, ownerId, intent, decision, idempotencyKey);
       activity.status = "failed";
       activity.error = e.message;
@@ -171,6 +201,10 @@ export class TransactionPipeline {
         activityId: activity.id,
       };
     }
+
+    checkAbort();
+    await input.onBeforeSubmit?.();
+    checkAbort();
 
     // PERSIST txHash BEFORE submit to survive crash window.
     // If process crashes after submit but before we return, the txHash is already
@@ -195,6 +229,9 @@ export class TransactionPipeline {
         submittedHash: result.hash,
       };
     } catch (e: any) {
+      if (signal?.aborted || e?.name === "AbortError") {
+        throw e;
+      }
       // Submit failed — record pre-submit hash + error for recovery/reconciliation
       const activity = this.resolveActivity(activityId, agentId, ownerId, intent, decision, idempotencyKey);
       activity.status = "failed";
@@ -274,12 +311,29 @@ export class TransactionPipeline {
     // the intent must be denied.
     // skipReservation: daily spending was already reserved at intent-creation time.
     // Re-evaluating here must NOT double-reserve.
-    const currentDecision = await this.policy.evaluate(approval.intent, approval.agentId, { skipReservation: true });
-    if (currentDecision.result === "deny") {
-      await this.approvalStore.update(approvalId, { status: "failed", error: `Policy re-evaluation denied: ${currentDecision.reason}` });
+    // skipApprovalThreshold: the approval being executed IS the satisfaction of
+    // the threshold gate, so it must not re-trigger requires_approval for the
+    // approved amount. Every other check (allowlist, max amount, daily limit,
+    // tx type) still applies, and anything that is not a clean `allow` blocks
+    // execution. FAIL-CLOSED, no silent re-queue: the approval is moved to
+    // terminal `failed` and the operator must create a fresh intent/approval
+    // if the payment is still wanted. Re-queueing would resurrect a stale
+    // approval the operator may already have acted on and risks a duplicate
+    // submission. The deny/allowlist reason is stored in approval.error and
+    // the linked activity error so it surfaces in the API response.
+    const currentDecision = await this.policy.evaluate(approval.intent, approval.agentId, { skipReservation: true, skipApprovalThreshold: true });
+    if (currentDecision.result !== "allow") {
+      const reason = `Policy re-evaluation did not allow execution: ${currentDecision.reason} (rule: ${currentDecision.rule})`;
+      await this.approvalStore.update(approvalId, { status: "failed", error: reason });
+      if (approval.activityId) {
+        const existing = await this.activityStore.get(approval.activityId);
+        if (existing) {
+          await this.activityStore.update(approval.activityId, { status: "failed", error: reason });
+        }
+      }
       return {
         status: "rejected",
-        message: `Policy re-evaluation denied: ${currentDecision.reason}`,
+        message: reason,
         policyDecision: currentDecision,
         simulationResult: null,
         activityId: approval.activityId,
@@ -313,7 +367,11 @@ export class TransactionPipeline {
 
     let tx;
     try {
-      tx = await this.builder.buildPayment(sourceAccount, intent as any, this.signer.getNetworkPassphrase());
+      if (intent.type === "account_settings") {
+        tx = await this.builder.buildAccountSettings(sourceAccount, intent as AccountSettingsIntent, this.signer.getNetworkPassphrase());
+      } else {
+        tx = await this.builder.buildPayment(sourceAccount, intent as any, this.signer.getNetworkPassphrase());
+      }
     } catch (e: any) {
       await this.approvalStore.update(approvalId, { status: "failed", error: e.message });
       return {
@@ -351,8 +409,12 @@ export class TransactionPipeline {
       };
     }
 
-    // PERSIST txHash BEFORE submit to survive crash window
+    // PERSIST txHash BEFORE submit to survive crash window.
+    // The approval record carries the pre-submit hash so the approval
+    // recovery sweeper (#376) can check on-chain whether this transaction
+    // landed even if the process dies between submit and the status update.
     const preSubmitHash = signedTx.hash().toString("hex");
+    await this.approvalStore.update(approvalId, { txHash: preSubmitHash });
 
     try {
       const result = await this.submitter.submit(signedTx, this.signer.getNetworkPassphrase());
@@ -372,7 +434,7 @@ export class TransactionPipeline {
         activityId: approval.activityId,
       };
     } catch (e: any) {
-      await this.approvalStore.update(approvalId, { status: "failed", error: e.message });
+      await this.approvalStore.update(approvalId, { status: "failed", error: e.message, txHash: preSubmitHash });
       return {
         status: "rejected",
         message: `Submission failed: ${e.message}`,
