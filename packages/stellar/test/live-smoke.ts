@@ -125,7 +125,7 @@ test("Live: TransactionBuilder output verifies against real Stellar tx validatio
   assert.equal(tx.networkPassphrase, TESTNET_PASSPHRASE, "network passphrase is testnet");
   assert.ok(tx.timeBounds, "timebounds set");
   assert.ok(tx.timeBounds.maxTime > tx.timeBounds.minTime, "valid time window");
-  assert.equal(Number(tx.fee), 100000, "base fee 0.01 XLM");
+  assert.equal(Number(tx.fee), 100, "network base fee (100 stroops)");
   // Sequence should be sourceAccount.sequence + 1
   assert.equal(tx.sequence, "101", "sequence = source + 1");
 
