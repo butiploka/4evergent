@@ -1,5 +1,6 @@
 // Stellar transaction pipeline
-export { StellarTransactionBuilder } from "./transaction-builder.js";
+export { StellarTransactionBuilder, resolveBaseFeeStroops, DEFAULT_BASE_FEE_STROOPS, STELLAR_BASE_FEE_ENV_VAR } from "./transaction-builder.js";
+export type { StellarTransactionBuilderOptions } from "./transaction-builder.js";
 export { StellarSimulator } from "./simulator.js";
 export { StellarSubmitter } from "./submitter.js";
 export { TransactionPipeline } from "./pipeline.js";
@@ -8,6 +9,10 @@ export type { PipelineOptions, PipelineExecuteInput, PipelineOutcome } from "./p
 // Transaction status reconciliation
 export { TransactionStatusReconciler } from "./reconciler.js";
 export type { TransactionStatusProvider, TransactionStatus, ReconciliationResult } from "./reconciler.js";
+
+// Stuck-approval recovery (crash between approval and submission)
+export { ApprovalRecoveryService, STALE_EXECUTING_APPROVAL_MS } from "./approval-recovery.js";
+export type { ApprovalRecoveryOptions, ApprovalRecoveryResult } from "./approval-recovery.js";
 
 // Signer abstraction
 export type { Signer } from "./signer.js";
