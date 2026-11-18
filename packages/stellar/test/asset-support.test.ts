@@ -62,7 +62,7 @@ test("ASSET: issued-asset payment is denied by asset allowlist (default [])", as
   const intent: AgentIntent = {
     type: "payment",
     asset: "USDC",
-    assetDetails: { code: "USDC", issuer: "GDUWFOAXXMRMVR4A5P2FVUKWJOHMLB7CI7T6U4CUVDGAMWYKRJWHBH7H" },
+    assetDetails: { code: "USDC", issuer: "GDI73WJ4SX7LOG3XZDJC3KCK6ED6E5NBYK2JUBQSPBCNNWEG3ZN7T75U" },
     destination: Keypair.random().publicKey(),
     amount: "10",
     reason: "issued asset payment test",
@@ -74,13 +74,13 @@ test("ASSET: issued-asset payment is denied by asset allowlist (default [])", as
 
 test("ASSET: issued-asset payment allowed when in allowlist still hits simulation gate", async () => {
   const { pipeline, _signer } = makePipeline({
-    rules: { allowedAssets: ["USDC:GDUWFOAXXMRMVR4A5P2FVUKWJOHMLB7CI7T6U4CUVDGAMWYKRJWHBH7H"], approvalThreshold: "1000000" },
+    rules: { allowedAssets: ["USDC:GDI73WJ4SX7LOG3XZDJC3KCK6ED6E5NBYK2JUBQSPBCNNWEG3ZN7T75U"], approvalThreshold: "1000000" },
   });
   const kp = Keypair.random();
   const intent: AgentIntent = {
     type: "payment",
     asset: "USDC",
-    assetDetails: { code: "USDC", issuer: "GDUWFOAXXMRMVR4A5P2FVUKWJOHMLB7CI7T6U4CUVDGAMWYKRJWHBH7H" },
+    assetDetails: { code: "USDC", issuer: "GDI73WJ4SX7LOG3XZDJC3KCK6ED6E5NBYK2JUBQSPBCNNWEG3ZN7T75U" },
     destination: kp.publicKey(),
     amount: "1",
     reason: "issued asset payment allowlist test",
@@ -107,7 +107,7 @@ test("ASSET: XLM payment regression still works with allowlist containing XLM", 
 test("ASSET: invalid asset code rejected at validation (via API parseIntent)", async () => {
   // This is an API-layer test; pipeline would reject anyway
   const { pipeline } = makePipeline({
-    rules: { allowedAssets: ["USDC:GDUWFOAXXMRMVR4A5P2FVUKWJOHMLB7CI7T6U4CUVDGAMWYKRJWHBH7H"] },
+    rules: { allowedAssets: ["USDC:GDI73WJ4SX7LOG3XZDJC3KCK6ED6E5NBYK2JUBQSPBCNNWEG3ZN7T75U"] },
   });
   const intent: AgentIntent = {
     type: "payment",
@@ -129,7 +129,7 @@ test("TRUSTLINE: policy deny prevents signing", async () => {
   const intent: AgentIntent = {
     type: "trustline",
     assetCode: "USDC",
-    issuer: "GDUWFOAXXMRMVR4A5P2FVUKWJOHMLB7CI7T6U4CUVDGAMWYKRJWHBH7H",
+    issuer: "GDI73WJ4SX7LOG3XZDJC3KCK6ED6E5NBYK2JUBQSPBCNNWEG3ZN7T75U",
     reason: "trustline policy deny test",
   };
   const result = await pipeline.execute({ intent, sourceAccount: fakeAccount("agent-a") });
@@ -138,13 +138,20 @@ test("TRUSTLINE: policy deny prevents signing", async () => {
 });
 
 test("TRUSTLINE: approval-required trustline does not sign before approval", async () => {
+  // #354: the asset allowlist is now checked before the approval threshold,
+  // so the trustline asset must itself be allowlisted to reach approval.
+  // (Trustline assets are keyed as `trustline:<code>:<issuer>`.)
   const { pipeline, signer, approval } = makePipeline({
-    rules: { requireHumanApprovalForAmountAbove: "0", maxTxAmount: { native: "1000000" } },
+    rules: {
+      requireHumanApprovalForAmountAbove: "0",
+      maxTxAmount: { native: "1000000" },
+      allowedAssets: ["trustline:USDC:GDI73WJ4SX7LOG3XZDJC3KCK6ED6E5NBYK2JUBQSPBCNNWEG3ZN7T75U"],
+    },
   });
   const intent: AgentIntent = {
     type: "trustline",
     assetCode: "USDC",
-    issuer: "GDUWFOAXXMRMVR4A5P2FVUKWJOHMLB7CI7T6U4CUVDGAMWYKRJWHBH7H",
+    issuer: "GDI73WJ4SX7LOG3XZDJC3KCK6ED6E5NBYK2JUBQSPBCNNWEG3ZN7T75U",
     limit: "1000",
     reason: "trustline approval test",
   };
@@ -165,7 +172,7 @@ test("TRUSTLINE: simulation failure prevents signing", async () => {
   const intent: AgentIntent = {
     type: "trustline",
     assetCode: "USDC",
-    issuer: "GDUWFOAXXMRMVR4A5P2FVUKWJOHMLB7CI7T6U4CUVDGAMWYKRJWHBH7H",
+    issuer: "GDI73WJ4SX7LOG3XZDJC3KCK6ED6E5NBYK2JUBQSPBCNNWEG3ZN7T75U",
     limit: "100",
     reason: "trustline simulation failure test",
   };
@@ -183,7 +190,7 @@ test("TRUSTLINE: XLM trustline rejected by policy native asset check", async () 
   const intent: AgentIntent = {
     type: "trustline",
     assetCode: "XLM",
-    issuer: "GDUWFOAXXMRMVR4A5P2FVUKWJOHMLB7CI7T6U4CUVDGAMWYKRJWHBH7H",
+    issuer: "GDI73WJ4SX7LOG3XZDJC3KCK6ED6E5NBYK2JUBQSPBCNNWEG3ZN7T75U",
     reason: "XLM trustline should fail",
   };
   const result = await pipeline.execute({ intent, sourceAccount: fakeAccount("agent-a") });
