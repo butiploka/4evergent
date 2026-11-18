@@ -6,6 +6,8 @@ import type {
   PolicyDecision,
   SimulationResult,
 } from "@4evergent/shared";
+import { getSharedConnection } from "./shared-connection.js";
+import { clampOffset, clampLimit } from "./pagination.js";
 import type {
   ActivityStore,
   ApprovalStore,
@@ -27,14 +29,13 @@ export class SQLiteActivityStore implements ActivityStore {
   private db: DatabaseSync;
 
   constructor(dbPath: string) {
-    this.db = new DatabaseSync(dbPath);
+    this.db = getSharedConnection(dbPath);
     this.initSchema();
   }
 
   private initSchema(): void {
     this.db.exec(`
       CREATE TABLE IF NOT EXISTS _meta (key TEXT PRIMARY KEY, value TEXT);
-      INSERT OR IGNORE INTO _meta (key, value) VALUES ('schema_version', '3');
 
       CREATE TABLE IF NOT EXISTS activities (
         id TEXT PRIMARY KEY,
@@ -69,6 +70,7 @@ export class SQLiteActivityStore implements ActivityStore {
           total REAL NOT NULL DEFAULT 0,
           PRIMARY KEY (agent_id, asset, day)
         );
+      CREATE INDEX IF NOT EXISTS idx_daily_spending_day ON daily_spending(day);
       `);
     } catch {
       // Table already exists.
@@ -108,31 +110,31 @@ export class SQLiteActivityStore implements ActivityStore {
     return row ? rowToActivityRecord(row as unknown as ActivityRow) : null;
   }
 
-  async listByAgent(agentId: string, limit = 50): Promise<ActivityRecord[]> {
+  async listByAgent(agentId: string, limit = 50, offset = 0): Promise<ActivityRecord[]> {
     const rows = this.db
-      .prepare("SELECT * FROM activities WHERE agent_id = ? ORDER BY created_at DESC LIMIT ?")
-      .all(agentId, limit);
+      .prepare("SELECT * FROM activities WHERE agent_id = ? ORDER BY created_at DESC LIMIT ? OFFSET ?")
+      .all(agentId, clampLimit(limit), clampOffset(offset));
     return rows.map((r) => rowToActivityRecord(r as unknown as ActivityRow));
   }
 
-  async listByStatus(agentId: string, status: string, limit = 50): Promise<ActivityRecord[]> {
+  async listByStatus(agentId: string, status: string, limit = 50, offset = 0): Promise<ActivityRecord[]> {
     const rows = this.db
-      .prepare("SELECT * FROM activities WHERE agent_id = ? AND status = ? ORDER BY created_at DESC LIMIT ?")
-      .all(agentId, status, limit);
+      .prepare("SELECT * FROM activities WHERE agent_id = ? AND status = ? ORDER BY created_at DESC LIMIT ? OFFSET ?")
+      .all(agentId, status, clampLimit(limit), clampOffset(offset));
     return rows.map((r) => rowToActivityRecord(r as unknown as ActivityRow));
   }
 
-  async listAll(limit = 50): Promise<ActivityRecord[]> {
+  async listAll(limit = 50, offset = 0): Promise<ActivityRecord[]> {
     const rows = this.db
-      .prepare("SELECT * FROM activities ORDER BY created_at DESC LIMIT ?")
-      .all(limit);
+      .prepare("SELECT * FROM activities ORDER BY created_at DESC LIMIT ? OFFSET ?")
+      .all(clampLimit(limit), clampOffset(offset));
     return rows.map((r) => rowToActivityRecord(r as unknown as ActivityRow));
   }
 
-  async listByOwner(ownerId: string, limit = 50): Promise<ActivityRecord[]> {
+  async listByOwner(ownerId: string, limit = 50, offset = 0): Promise<ActivityRecord[]> {
     const rows = this.db
-      .prepare("SELECT * FROM activities WHERE owner_id = ? ORDER BY created_at DESC LIMIT ?")
-      .all(ownerId, limit);
+      .prepare("SELECT * FROM activities WHERE owner_id = ? ORDER BY created_at DESC LIMIT ? OFFSET ?")
+      .all(ownerId, clampLimit(limit), clampOffset(offset));
     return rows.map((r) => rowToActivityRecord(r as unknown as ActivityRow));
   }
 
@@ -213,12 +215,11 @@ export class SQLiteActivityStore implements ActivityStore {
    * Concurrent calls are serialized by SQLite's row-level locking. The PRIMARY KEY
    * (agent_id, asset, day) ensures one row per asset per day.
    */
-  async reserveDailySpending(agentId: string, asset: string, amount: string, limit: string): Promise<boolean> {
+  async reserveDailySpending(agentId: string, asset: string, amount: string, limit: string, now = new Date()): Promise<boolean> {
     const amountNum = parseFloat(amount);
     const limitNum = parseFloat(limit);
     if (isNaN(amountNum) || isNaN(limitNum)) return false;
 
-    const now = new Date();
     const day = new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), now.getUTCDate()))
       .toISOString()
       .slice(0, 10); // YYYY-MM-DD
@@ -258,14 +259,24 @@ export class SQLiteActivityStore implements ActivityStore {
     }
   }
 
-  async getDailySpending(agentId: string, asset: string): Promise<number | null> {
-    const now = new Date();
+  async getDailySpending(agentId: string, asset: string, now = new Date()): Promise<number | null> {
     const day = new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), now.getUTCDate()))
       .toISOString().slice(0, 10);
     const row = this.db
       .prepare(`SELECT total FROM daily_spending WHERE agent_id = ? AND asset = ? AND day = ?`)
       .get(agentId, asset, day) as { total: number } | undefined;
     return row ? row.total : null;
+  }
+
+  async sweepDailySpending(cutoffDay: string, limit = 500): Promise<number> {
+    if (!/^\d{4}-\d{2}-\d{2}$/.test(cutoffDay) || !Number.isInteger(limit) || limit <= 0) return 0;
+    const result = this.db.prepare(`
+      DELETE FROM daily_spending
+      WHERE rowid IN (
+        SELECT rowid FROM daily_spending WHERE day < ? ORDER BY day ASC LIMIT ?
+      )
+    `).run(cutoffDay, limit);
+    return Number(result.changes);
   }
 
   async update(id: string, patch: Partial<ActivityRecord>): Promise<ActivityRecord | null> {
@@ -277,7 +288,7 @@ export class SQLiteActivityStore implements ActivityStore {
   }
 
   close(): void {
-    this.db.close();
+    // Shared connection — managed by closeSharedConnection() / closeAllSharedConnections()
   }
 }
 
@@ -301,14 +312,13 @@ export class SQLiteApprovalStore implements ApprovalStore {
   private db: DatabaseSync;
 
   constructor(dbPath: string) {
-    this.db = new DatabaseSync(dbPath);
+    this.db = getSharedConnection(dbPath);
     this.initSchema();
   }
 
   private initSchema(): void {
     this.db.exec(`
       CREATE TABLE IF NOT EXISTS _meta (key TEXT PRIMARY KEY, value TEXT);
-      INSERT OR IGNORE INTO _meta (key, value) VALUES ('schema_version', '2');
 
       CREATE TABLE IF NOT EXISTS approvals (
         id TEXT PRIMARY KEY,
@@ -410,34 +420,60 @@ export class SQLiteApprovalStore implements ApprovalStore {
     return rowToApprovalRecord(row as unknown as ApprovalRow);
   }
 
-  async listByAgent(agentId: string, limit = 50): Promise<ApprovalRecord[]> {
+  async listByAgent(agentId: string, limit = 50, offset = 0, status?: string): Promise<ApprovalRecord[]> {
+    const safeOffset = clampOffset(offset);
+    if (status === undefined) {
+      const rows = this.db
+        .prepare("SELECT * FROM approvals WHERE agent_id = ? ORDER BY created_at DESC LIMIT ? OFFSET ?")
+        .all(agentId, clampLimit(limit), safeOffset);
+      return rows.map((r) => rowToApprovalRecord(r as unknown as ApprovalRow));
+    }
     const rows = this.db
-      .prepare("SELECT * FROM approvals WHERE agent_id = ? ORDER BY created_at DESC LIMIT ?")
-      .all(agentId, limit);
+      .prepare("SELECT * FROM approvals WHERE agent_id = ? AND status = ? ORDER BY created_at DESC LIMIT ? OFFSET ?")
+      .all(agentId, status, clampLimit(limit), safeOffset);
     return rows.map((r) => rowToApprovalRecord(r as unknown as ApprovalRow));
   }
 
-  async listByStatus(agentId: string, status: string, limit = 50): Promise<ApprovalRecord[]> {
+  async listByStatus(agentId: string, status: string, limit = 50, offset = 0): Promise<ApprovalRecord[]> {
     const rows = this.db
       .prepare(
-        "SELECT * FROM approvals WHERE agent_id = ? AND status = ? ORDER BY created_at DESC LIMIT ?"
+        "SELECT * FROM approvals WHERE agent_id = ? AND status = ? ORDER BY created_at DESC LIMIT ? OFFSET ?"
       )
-      .all(agentId, status, limit);
+      .all(agentId, status, clampLimit(limit), clampOffset(offset));
     return rows.map((r) => rowToApprovalRecord(r as unknown as ApprovalRow));
   }
 
-  async listAll(limit = 50): Promise<ApprovalRecord[]> {
+  async listAll(limit = 50, offset = 0): Promise<ApprovalRecord[]> {
     const rows = this.db
-      .prepare("SELECT * FROM approvals ORDER BY created_at DESC LIMIT ?")
-      .all(limit);
+      .prepare("SELECT * FROM approvals ORDER BY created_at DESC LIMIT ? OFFSET ?")
+      .all(clampLimit(limit), clampOffset(offset));
     return rows.map((r) => rowToApprovalRecord(r as unknown as ApprovalRow));
   }
 
-  async listByOwner(ownerId: string, limit = 50): Promise<ApprovalRecord[]> {
+  async listByOwner(ownerId: string, limit = 50, offset = 0, status?: string): Promise<ApprovalRecord[]> {
+    const safeOffset = clampOffset(offset);
+    if (status === undefined) {
+      const rows = this.db
+        .prepare("SELECT * FROM approvals WHERE owner_id = ? ORDER BY created_at DESC LIMIT ? OFFSET ?")
+        .all(ownerId, clampLimit(limit), safeOffset);
+      return rows.map((r) => rowToApprovalRecord(r as unknown as ApprovalRow));
+    }
     const rows = this.db
-      .prepare("SELECT * FROM approvals WHERE owner_id = ? ORDER BY updated_at DESC LIMIT ?")
-      .all(ownerId, limit);
+      .prepare("SELECT * FROM approvals WHERE owner_id = ? AND status = ? ORDER BY created_at DESC LIMIT ? OFFSET ?")
+      .all(ownerId, status, clampLimit(limit), safeOffset);
     return rows.map((r) => rowToApprovalRecord(r as unknown as ApprovalRow));
+  }
+
+  async countByOwner(ownerId: string, status?: string): Promise<number> {
+    const row =
+      status === undefined
+        ? this.db
+            .prepare("SELECT COUNT(*) AS count FROM approvals WHERE owner_id = ?")
+            .get(ownerId)
+        : this.db
+            .prepare("SELECT COUNT(*) AS count FROM approvals WHERE owner_id = ? AND status = ?")
+            .get(ownerId, status);
+    return Number((row as unknown as { count: number | bigint }).count);
   }
 
   async getForOwner(id: string, ownerId: string): Promise<ApprovalRecord | null> {
@@ -455,9 +491,79 @@ export class SQLiteApprovalStore implements ApprovalStore {
     return updated;
   }
 
-  close(): void {
-    this.db.close();
+  async updateIfStatus(id: string, expectedStatus: ApprovalStatus, patch: Partial<ApprovalRecord>): Promise<ApprovalRecord | null> {
+    const partial = buildApprovalPartialUpdate(patch);
+    if (!partial) {
+      const row = this.db
+        .prepare("SELECT * FROM approvals WHERE id = ? AND status = ?")
+        .get(id, expectedStatus) as unknown as ApprovalRow | undefined;
+      return row ? rowToApprovalRecord(row) : null;
+    }
+
+    // Single-statement compare-and-swap: the status guard is evaluated by
+    // SQLite in the same statement that writes, so exactly one concurrent
+    // claimer can win and no other column is overwritten. (Same rationale as
+    // SQLiteExecutionStore.updateIfStatus; see execution-store.ts.)
+    // updated_at is always refreshed, matching InMemoryApprovalStore.
+    const result = this.db
+      .prepare(`UPDATE approvals SET ${partial.sql}, updated_at = @p_updated_at WHERE id = @id AND status = @expected_status`)
+      .run({ ...partial.params, p_updated_at: new Date().toISOString(), id, expected_status: expectedStatus });
+    if (Number(result.changes) === 0) return null;
+
+    return this.get(id);
   }
+
+  close(): void {
+    // Shared connection — managed by closeSharedConnection() / closeAllSharedConnections()
+  }
+}
+
+/**
+ * Columns writable by SQLiteApprovalStore.updateIfStatus().
+ * `id` is deliberately absent: the primary key is immutable.
+ */
+const APPROVAL_WRITE_COLUMNS: Record<string, string> = {
+  activityId: "activity_id",
+  agentId: "agent_id",
+  ownerId: "owner_id",
+  intent: "intent_json",
+  policyDecision: "policy_decision_json",
+  status: "status",
+  requestedAt: "requested_at",
+  approvedAt: "approved_at",
+  rejectedAt: "rejected_at",
+  expiredAt: "expired_at",
+  approver: "approver",
+  expiresAt: "expires_at",
+  txHash: "tx_hash",
+  error: "error",
+  createdAt: "created_at",
+  updatedAt: "updated_at",
+};
+
+const APPROVAL_JSON_COLUMNS = new Set(["intent_json", "policy_decision_json"]);
+
+/**
+ * Builds a partial SET clause from a patch: only the caller's fields are
+ * written, in one statement. `undefined` values are skipped ("field not
+ * supplied"); explicit `null` clears. Returns null when the patch carries
+ * nothing writable (caller falls back to a status-guarded read).
+ */
+function buildApprovalPartialUpdate(patch: Partial<ApprovalRecord>): { sql: string; params: Record<string, unknown> } | null {
+  const assignments: string[] = [];
+  const params: Record<string, unknown> = {};
+  for (const [key, value] of Object.entries(patch)) {
+    // hasOwnProperty guard: a `__proto__`/`constructor` key from an untrusted
+    // patch must not resolve to an inherited value and end up in the SET clause.
+    if (!Object.prototype.hasOwnProperty.call(APPROVAL_WRITE_COLUMNS, key)) continue;
+    const column = APPROVAL_WRITE_COLUMNS[key];
+    if (!column || value === undefined) continue;
+    const param = `p_${column}`;
+    assignments.push(`${column} = @${param}`);
+    params[param] = APPROVAL_JSON_COLUMNS.has(column) ? JSON.stringify(value) : value;
+  }
+  if (assignments.length === 0) return null;
+  return { sql: assignments.join(", "), params };
 }
 
 // ============================================================
