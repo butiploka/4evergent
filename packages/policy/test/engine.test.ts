@@ -61,6 +61,86 @@ test("denies disallowed destination", async () => {
   assert.match(decision.reason, /allowed_destinations/);
 });
 
+// #354: the allowlist is a hard boundary — it is checked BEFORE the approval
+// threshold, so an above-threshold intent to a disallowed destination/asset/
+// contract is denied outright instead of being routed to requires_approval.
+test("denies above-threshold payment to disallowed destination (allowlist beats threshold)", async () => {
+  const engine = new PolicyEngine({
+    allowedDestinations: ["GONLY"],
+    requireHumanApprovalForAmountAbove: "50",
+  });
+  const decision = await engine.evaluate(baseIntent({ amount: "100", destination: "GEVIL" }), "GAGENT");
+  assert.equal(decision.result, "deny");
+  assert.equal(decision.rule, "allowedDestinations");
+  assert.match(decision.reason, /allowed_destinations/);
+});
+
+test("denies above-threshold payment with disallowed asset (allowlist beats threshold)", async () => {
+  const engine = new PolicyEngine({
+    allowedAssets: ["XLM"],
+    requireHumanApprovalForAmountAbove: "50",
+  });
+  const decision = await engine.evaluate(baseIntent({ amount: "100", asset: "USDC" }), "GAGENT");
+  assert.equal(decision.result, "deny");
+  assert.equal(decision.rule, "allowedAssets");
+});
+
+test("denies contract call to disallowed contract", async () => {
+  // Contract calls carry no amount, so the threshold never applies to them;
+  // this pins the contract allowlist itself. The threshold-ordering proof
+  // lives in the destination/asset tests above.
+  const engine = new PolicyEngine({
+    // Contract calls carry no payment asset (extractAsset → "native"), so
+    // allowlist "native" here to let the denial come from the contract list.
+    allowedAssets: ["XLM", "native"],
+    allowedContractIds: ["CONLY"],
+    requireHumanApprovalForAmountAbove: "50",
+    txTypeRestrictions: { contract_call: true },
+  });
+  const intent = { type: "contract_call", contractId: "CEVIL", reason: "test" } as AgentIntent;
+  const decision = await engine.evaluate(intent, "GAGENT");
+  assert.equal(decision.result, "deny");
+  assert.equal(decision.rule, "allowedContractIds");
+});
+
+test("above-threshold payment to allowed destination still requires approval", async () => {
+  const engine = new PolicyEngine({
+    allowedDestinations: ["GONLY"],
+    requireHumanApprovalForAmountAbove: "50",
+  });
+  const decision = await engine.evaluate(baseIntent({ amount: "100", destination: "GONLY" }), "GAGENT");
+  assert.equal(decision.result, "requires_approval");
+  assert.equal(decision.rule, "approvalThreshold");
+});
+
+test("below-threshold payment to disallowed destination still denied", async () => {
+  const engine = new PolicyEngine({
+    allowedDestinations: ["GONLY"],
+    requireHumanApprovalForAmountAbove: "50",
+  });
+  const decision = await engine.evaluate(baseIntent({ amount: "10", destination: "GEVIL" }), "GAGENT");
+  assert.equal(decision.result, "deny");
+  assert.equal(decision.rule, "allowedDestinations");
+});
+
+test("skipApprovalThreshold: approved amount re-evaluates to allow, allowlist still enforced", async () => {
+  const engine = new PolicyEngine({
+    allowedDestinations: ["GONLY"],
+    requireHumanApprovalForAmountAbove: "50",
+  });
+  // Threshold gate satisfied by the approval itself → allow.
+  const allowed = await engine.evaluate(
+    baseIntent({ amount: "100", destination: "GONLY" }), "GAGENT", { skipApprovalThreshold: true }
+  );
+  assert.equal(allowed.result, "allow");
+  // Tightened allowlist still blocks, even with the threshold skipped.
+  const denied = await engine.evaluate(
+    baseIntent({ amount: "100", destination: "GEVIL" }), "GAGENT", { skipApprovalThreshold: true }
+  );
+  assert.equal(denied.result, "deny");
+  assert.equal(denied.rule, "allowedDestinations");
+});
+
 test("denies tx type not in allowlist", async () => {
   const engine = new PolicyEngine({ txTypeRestrictions: { payment: false } });
   const decision = await engine.evaluate(baseIntent({}), "GAGENT");
